@@ -1,1226 +1,946 @@
 import streamlit as st
 import pandas as pd
 import gspread
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 import os
 from dotenv import load_dotenv
 import openai
-from datetime import datetime
+from datetime import datetime, date # Import date for st.date_input
 import plotly.express as px
 import plotly.graph_objects as go
 import time
-from google.api_core import retry
 import re
-import indicators
-import strategic_targets
+import indicators # Our new indicators module
+import strategic_targets # For referencing targets in display
 
 # Load environment variables
 load_dotenv()
 
-# Configure page
+# --- Page Configuration ---
 st.set_page_config(
-    page_title="Healthcare Delivery Dashboard",
+    page_title="Healthcare Delivery OS",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Initialize session state
-if 'data' not in st.session_state:
-    st.session_state.data = {}
-
-def setup_google_sheets():
-    """Initialize Google Sheets connection with retry logic"""
-    max_retries = 3
-    retry_delay = 2  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            # Check if credentials file exists
-            credentials_file = os.getenv('GOOGLE_SHEETS_CREDENTIALS_FILE')
-            if not credentials_file or not os.path.exists(credentials_file):
-                st.error(f"Credentials file not found: {credentials_file}")
-                return None
-
-            # Check if sheet name is configured
-            sheet_name = os.getenv('GOOGLE_SHEET_NAME')
-            if not sheet_name:
-                st.error("GOOGLE_SHEET_NAME not configured in .env file")
-                return None
-
-            scopes = [
-                'https://www.googleapis.com/auth/spreadsheets',
-                'https://www.googleapis.com/auth/drive'
-            ]
-            
-            credentials = Credentials.from_service_account_file(
-                credentials_file,
-                scopes=scopes
-            )
-            
-            gc = gspread.authorize(credentials)
-            
-            # Try to open the sheet
-            try:
-                sheet = gc.open(sheet_name)
-                # Test the connection by getting the first worksheet
-                sheet.get_worksheet(0)
-                return sheet
-            except gspread.exceptions.SpreadsheetNotFound:
-                st.error(f"Spreadsheet '{sheet_name}' not found. Please check the name and sharing permissions.")
-                return None
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    st.warning(f"Attempt {attempt + 1} failed. Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    continue
-                else:
-                    st.error(f"Error accessing spreadsheet after {max_retries} attempts: {str(e)}")
-                    return None
-                
-        except Exception as e:
-            if attempt < max_retries - 1:
-                st.warning(f"Attempt {attempt + 1} failed. Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                continue
-            else:
-                st.error(f"Unexpected error in setup_google_sheets: {str(e)}")
-                return None
-    
-    return None
-
-def load_sheet_data(sheet, worksheet_name):
-    """Load data from a specific worksheet with retry logic"""
-    max_retries = 3
-    retry_delay = 2  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            worksheet = sheet.worksheet(worksheet_name)
-            all_values = worksheet.get_all_values()
-            
-            if not all_values:
-                return pd.DataFrame()
-                
-            # Convert to DataFrame
-            df = pd.DataFrame(all_values[1:], columns=all_values[0])
-            
-            # Clean column names
-            df.columns = df.columns.str.strip()
-            
-            # Remove empty rows
-            df = df.replace('', pd.NA).dropna(how='all')
-            
-            return df
-            
-        except Exception as e:
-            if attempt < max_retries - 1:
-                st.warning(f"Error loading {worksheet_name}, attempt {attempt + 1}. Retrying...")
-                time.sleep(retry_delay)
-                continue
-            else:
-                st.error(f"Error loading {worksheet_name} after {max_retries} attempts: {str(e)}")
-                return pd.DataFrame()
-
-def get_fiscal_year():
-    """Get current fiscal year (July 1 - June 30)"""
-    today = datetime.now()
-    if today.month >= 7:  # July or later
-        return today.year
-    return today.year - 1
-
-def calculate_dashboard_metrics(data):
-    """Calculate all dashboard metrics"""
-    metrics = {}
-    
-    # Revenue Metrics
-    if 'Project Inventory' in data and not data['Project Inventory'].empty:
-        try:
-            project_df = data['Project Inventory'].copy()
-            # Clean and convert Revenue column properly
-            project_df['Revenue'] = project_df['Revenue'].astype(str).str.replace('$', '').str.replace(',', '').str.strip()
-            project_df['Revenue'] = pd.to_numeric(project_df['Revenue'], errors='coerce').fillna(0)
-            
-            # Get current fiscal year
-            current_fy = get_fiscal_year()
-            
-            # Calculate revenue metrics
-            metrics['total_revenue'] = float(project_df['Revenue'].sum())
-            red_projects = project_df[project_df['Status (R/Y/G)'].str.strip().str.lower() == 'red']
-            metrics['red_projects'] = len(red_projects)
-            metrics['total_projects'] = len(project_df)
-            metrics['red_project_revenue'] = float(red_projects['Revenue'].sum())
-        except Exception as e:
-            st.error(f"Error calculating revenue metrics: {str(e)}")
-    
-    # Pipeline Metrics
-    if 'Pipeline' in data and not data['Pipeline'].empty:
-        try:
-            pipeline_df = data['Pipeline'].copy()
-            pipeline_df['Percieved Annual AMO'] = pipeline_df['Percieved Annual AMO'].astype(str).str.replace('$', '').str.replace(',', '').str.strip()
-            pipeline_df['Percieved Annual AMO'] = pd.to_numeric(pipeline_df['Percieved Annual AMO'], errors='coerce').fillna(0)
-            
-            metrics['total_pipeline'] = float(pipeline_df['Percieved Annual AMO'].sum())
-            metrics['total_potential'] = float(pipeline_df['Percieved Annual AMO'].sum())
-        except Exception as e:
-            st.error(f"Error calculating pipeline metrics: {str(e)}")
-    
-    # Risk Metrics
-    if 'Project Risks' in data and not data['Project Risks'].empty:
-        try:
-            risk_df = data['Project Risks'].copy()
-            
-            # Convert Impact to numeric
-            risk_df['Impact ($)'] = risk_df['Impact ($)'].astype(str).str.replace('$', '').str.replace(',', '')
-            risk_df['Impact ($)'] = pd.to_numeric(risk_df['Impact ($)'], errors='coerce').fillna(0)
-            # Fill missing values for Severity and Impact ($)
-            risk_df['Severity'] = risk_df['Severity'].fillna('')
-            risk_df['Impact ($)'] = risk_df['Impact ($)'].fillna(0)
-            
-            # Add risk metrics
-            high_risk_impact = risk_df[risk_df['Severity'].str.lower() == 'high']['Impact ($)'].sum()
-            total_risk_impact = risk_df['Impact ($)'].sum()
-            
-            metrics['high_risk_impact'] = float(high_risk_impact)
-            metrics['total_risk_impact'] = float(total_risk_impact)
-            metrics['high_risk_percent'] = float((high_risk_impact/total_risk_impact*100 if total_risk_impact > 0 else 0))
-            
-        except Exception as e:
-            st.error(f"Error calculating risk metrics: {str(e)}")
-    
-    # Utilization Metrics
-    if 'Team Utilization' in data and not data['Team Utilization'].empty:
-        try:
-            util_df = data['Team Utilization'].copy()
-            util_df['Utilization (%)'] = util_df['Utilization (%)'].astype(str).str.replace('%', '')
-            util_df['Utilization (%)'] = pd.to_numeric(util_df['Utilization (%)'], errors='coerce').fillna(0)
-            
-            # Split executive and delivery
-            exec_df = util_df[util_df['Role'].str.contains('Executive', case=False, na=False)]
-            delivery_df = util_df[~util_df['Role'].str.contains('Executive', case=False, na=False)]
-            
-            metrics['exec_utilization'] = float(exec_df['Utilization (%)'].mean()) if not exec_df.empty else 0.0
-            metrics['delivery_utilization'] = float(delivery_df['Utilization (%)'].mean()) if not delivery_df.empty else 0.0
-            metrics['over_utilized_execs'] = len(exec_df[exec_df['Utilization (%)'] > 70]) if not exec_df.empty else 0
-            metrics['under_utilized_delivery'] = len(delivery_df[delivery_df['Utilization (%)'] < 70]) if not delivery_df.empty else 0
-        except Exception as e:
-            st.error(f"Error calculating utilization metrics: {str(e)}")
-    
-    # Strategic Metrics
-    if 'Executive Activity' in data and not data['Executive Activity'].empty:
-        try:
-            exec_df = data['Executive Activity'].copy()
-            exec_df['Strategic Cost ($)'] = exec_df['Strategic Cost ($)'].astype(str).str.replace('$', '').str.replace(',', '')
-            exec_df['Strategic Cost ($)'] = pd.to_numeric(exec_df['Strategic Cost ($)'], errors='coerce').fillna(0)
-            
-            metrics['strategic_cost'] = float(exec_df['Strategic Cost ($)'].sum())
-            metrics['strategic_activities'] = len(exec_df)
-        except Exception as e:
-            st.error(f"Error calculating strategic metrics: {str(e)}")
-    
-    return metrics
-
-def query_openai(question, data_context):
-    """Query OpenAI with the user's question and data context"""
-    try:
-        client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# --- Global Styling ---
+st.markdown("""
+    <style>
+        /* General improvements */
+        .stApp {
+            /* background-color: #f0f2f5; */ 
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 24px; 
+        }
+        .stTabs [data-baseweb="tab"] { 
+            height: 44px;
+            white-space: pre-wrap;
+            background-color: #f0f2f6; 
+            border-radius: 4px 4px 0px 0px;
+            padding: 10px 15px;
+            color: #4A5568; 
+            font-weight: 500; 
+            border-bottom: 1px solid #e0e0e0; 
+        }
+        .stTabs [aria-selected="true"] { 
+            background-color: #FFFFFF; 
+            color: #2D3748; 
+            font-weight: 600; 
+            box-shadow: 0 -2px 4px rgba(0,0,0,0.03); 
+            border-bottom: 1px solid #FFFFFF; 
+        }
         
-        # Prepare the prompt with data context
-        prompt = f"""Based on the following healthcare delivery data:
-        {data_context}
-        
-        Question: {question}
-        
-        Please provide a clear, concise answer focusing on actionable insights."""
-        
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a healthcare delivery analytics assistant. Provide clear, data-driven insights."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=500
-        )
-        
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error querying OpenAI: {str(e)}"
-
-def create_analytics_visualizations(data):
-    """Create analytics visualizations for the dashboard"""
-    visualizations = []
-    
-    # 1. Pipeline Analysis
-    if 'Pipeline' in data and not data['Pipeline'].empty:
-        try:
-            # Create pipeline analysis
-            pipeline_df = data['Pipeline'].copy()
-            
-            # Convert columns to numeric, handling string values
-            pipeline_df['Percieved Annual AMO'] = pipeline_df['Percieved Annual AMO'].astype(str).str.replace('$', '').str.replace(',', '')
-            pipeline_df['Percieved Annual AMO'] = pd.to_numeric(pipeline_df['Percieved Annual AMO'], errors='coerce').fillna(0)
-            
-            # Sort by annual amount
-            pipeline_df = pipeline_df.sort_values('Percieved Annual AMO', ascending=False)
-            
-            # Create pipeline chart
-            fig_pipeline = px.bar(
-                pipeline_df.head(10),
-                x='Account',
-                y='Percieved Annual AMO',
-                title='Top 10 Pipeline Opportunities by Annual Amount',
-                labels={'Percieved Annual AMO': 'Annual Amount ($)', 'Account': 'Account'},
-                color='Percieved Annual AMO',
-                color_continuous_scale='RdYlGn'
-            )
-            fig_pipeline.update_layout(xaxis_tickangle=-45)
-            visualizations.append(('Pipeline Analysis', fig_pipeline))
-            
-            # Add pipeline metrics
-            total_potential = pipeline_df['Percieved Annual AMO'].sum()
-            
-            # Calculate pipeline health metrics
-            deal_registered = len(pipeline_df[pipeline_df['Deal Registered YN'].str.lower() == 'y'])
-            has_roadmap = len(pipeline_df[pipeline_df['Agreed Upon Roadmap YN'].str.lower() == 'y'])
-            has_business_case = len(pipeline_df[pipeline_df['Business Case_ROI YN'].str.lower() == 'y'])
-            has_sponsor = len(pipeline_df[pipeline_df['Business Sponsor YN'].str.lower() == 'y'])
-            
-            pipeline_metrics = {
-                'Total Pipeline Value': f"${total_potential:,.2f}",
-                'Deals Registered': str(deal_registered),
-                'Deals with Roadmap': str(has_roadmap),
-                'Deals with Business Case': str(has_business_case),
-                'Deals with Sponsor': str(has_sponsor)
-            }
-            visualizations.append(('Pipeline Metrics', pipeline_metrics))
-            
-        except Exception as e:
-            st.error(f"Error creating pipeline visualization: {str(e)}")
-    
-    # 2. Risk Analysis
-    if 'Project Risks' in data and not data['Project Risks'].empty:
-        try:
-            risk_df = data['Project Risks'].copy()
-            
-            # Convert Impact to numeric
-            risk_df['Impact ($)'] = risk_df['Impact ($)'].astype(str).str.replace('$', '').str.replace(',', '')
-            risk_df['Impact ($)'] = pd.to_numeric(risk_df['Impact ($)'], errors='coerce').fillna(0)
-            # Fill missing values for Severity and Impact ($)
-            risk_df['Severity'] = risk_df['Severity'].fillna('')
-            risk_df['Impact ($)'] = risk_df['Impact ($)'].fillna(0)
-            
-            # Create risk distribution chart
-            fig_risk = px.pie(
-                risk_df,
-                names='Severity',
-                values='Impact ($)',
-                title='Risk Distribution by Severity',
-                color='Severity',
-                color_discrete_map={
-                    'High': '#ffcdd2',
-                    'Medium': '#fff9c4',
-                    'Low': '#c8e6c9'
-                }
-            )
-            visualizations.append(('Risk Distribution', fig_risk))
-            
-            # Add risk metrics
-            high_risk_impact = risk_df[risk_df['Severity'].str.lower() == 'high']['Impact ($)'].sum()
-            total_risk_impact = risk_df['Impact ($)'].sum()
-            
-            risk_metrics = {
-                'High Risk Impact': f"${high_risk_impact:,.2f}",
-                'Total Risk Impact': f"${total_risk_impact:,.2f}",
-                'High Risk %': f"{(high_risk_impact/total_risk_impact*100 if total_risk_impact > 0 else 0):.1f}%"
-            }
-            visualizations.append(('Risk Metrics', risk_metrics))
-            
-        except Exception as e:
-            st.error(f"Error creating risk visualization: {str(e)}")
-    
-    # 3. Team Utilization Analysis
-    if 'Team Utilization' in data and not data['Team Utilization'].empty:
-        try:
-            util_df = data['Team Utilization'].copy()
-            
-            # Convert Utilization to numeric
-            util_df['Utilization (%)'] = util_df['Utilization (%)'].astype(str).str.replace('%', '')
-            util_df['Utilization (%)'] = pd.to_numeric(util_df['Utilization (%)'], errors='coerce').fillna(0)
-            
-            # Split into executive and delivery teams
-            exec_df = util_df[util_df['Role'].str.contains('Executive', case=False, na=False)]
-            delivery_df = util_df[~util_df['Role'].str.contains('Executive', case=False, na=False)]
-            
-            # Create executive utilization chart (red is bad, green is good)
-            if not exec_df.empty:
-                fig_exec = px.bar(
-                    exec_df.sort_values('Utilization (%)', ascending=False),
-                    x='Employee Name',
-                    y='Utilization (%)',
-                    title='Executive Team Utilization',
-                    color='Utilization (%)',
-                    color_continuous_scale='RdYlGn_r'  # Reversed scale: red is high (bad), green is low (good)
-                )
-                fig_exec.update_layout(xaxis_tickangle=-45)
-                visualizations.append(('Executive Utilization', fig_exec))
-                
-                # Add executive metrics
-                avg_exec_util = exec_df['Utilization (%)'].mean()
-                high_util_execs = len(exec_df[exec_df['Utilization (%)'] > 70])  # High utilization is concerning for execs
-                
-                exec_metrics = {
-                    'Average Executive Utilization': f"{avg_exec_util:.1f}%",
-                    'Executives Over 70% Utilized': str(high_util_execs),
-                    'Opportunity Cost Risk': 'High' if high_util_execs > 0 else 'Low'
-                }
-                visualizations.append(('Executive Metrics', exec_metrics))
-            
-            # Create delivery team utilization chart (green is good, red is bad)
-            if not delivery_df.empty:
-                fig_delivery = px.bar(
-                    delivery_df.sort_values('Utilization (%)', ascending=False),
-                    x='Employee Name',
-                    y='Utilization (%)',
-                    title='Delivery Team Utilization',
-                    color='Utilization (%)',
-                    color_continuous_scale='RdYlGn'  # Normal scale: green is high (good), red is low (bad)
-                )
-                fig_delivery.update_layout(xaxis_tickangle=-45)
-                visualizations.append(('Delivery Team Utilization', fig_delivery))
-                
-                # Add delivery metrics
-                avg_delivery_util = delivery_df['Utilization (%)'].mean()
-                under_utilized = len(delivery_df[delivery_df['Utilization (%)'] < 70])
-                over_utilized = len(delivery_df[delivery_df['Utilization (%)'] > 100])
-                
-                delivery_metrics = {
-                    'Average Delivery Utilization': f"{avg_delivery_util:.1f}%",
-                    'Under-Utilized Team Members': str(under_utilized),
-                    'Over-Utilized Team Members': str(over_utilized)
-                }
-                visualizations.append(('Delivery Metrics', delivery_metrics))
-            
-        except Exception as e:
-            st.error(f"Error creating utilization visualization: {str(e)}")
-    
-    # 4. Project Status Analysis
-    if 'Project Inventory' in data and not data['Project Inventory'].empty:
-        try:
-            project_df = data['Project Inventory'].copy()
-            
-            # Convert Revenue to numeric
-            project_df['Revenue'] = project_df['Revenue'].astype(str).str.replace('$', '').str.replace(',', '')
-            project_df['Revenue'] = pd.to_numeric(project_df['Revenue'], errors='coerce').fillna(0)
-            
-            # Create project status chart
-            status_counts = project_df['Status (R/Y/G)'].value_counts()
-            fig_status = px.pie(
-                values=status_counts.values,
-                names=status_counts.index,
-                title='Project Status Distribution',
-                color=status_counts.index,
-                color_discrete_map={
-                    'R': '#ffcdd2',
-                    'Y': '#fff9c4',
-                    'G': '#c8e6c9'
-                }
-            )
-            visualizations.append(('Project Status', fig_status))
-            
-            # Add project metrics
-            total_revenue = project_df['Revenue'].sum()
-            at_risk_revenue = project_df[project_df['Status (R/Y/G)'] == 'R']['Revenue'].sum()
-            
-            project_metrics = {
-                'Total Project Revenue': f"${total_revenue:,.2f}",
-                'At-Risk Project Revenue': f"${at_risk_revenue:,.2f}",
-                'At-Risk %': f"{(at_risk_revenue/total_revenue*100 if total_revenue > 0 else 0):.1f}%"
-            }
-            visualizations.append(('Project Metrics', project_metrics))
-            
-        except Exception as e:
-            st.error(f"Error creating project visualization: {str(e)}")
-    
-    return visualizations
-
-def render_homepage(data, openai_client):
-    st.title("\U0001F3E5 Healthcare Delivery Dashboard")
-    
-    # Add CSS for metric cards
-    st.markdown("""
-        <style>
+        /* Metric card styling */
         .metric-card {
-            background-color: #f0f2f6;
+            background-color: #FFFFFF;
             border: 1px solid #e0e0e0;
-            border-radius: 5px;
-            padding: 15px;
-            margin: 5px 0;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        }
-        .metric-card.above-target {
-            border-left: 4px solid #28a745;
-        }
-        .metric-card.below-target {
-            border-left: 4px solid #dc3545;
-        }
-        .metric-title {
-            color: #666;
-            font-size: 0.9em;
-            margin-bottom: 5px;
-        }
-        .metric-value {
-            font-size: 1.5em;
-            font-weight: bold;
-            color: #262730;
-        }
-        .metric-delta {
-            font-size: 0.9em;
-            color: #666;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-    
-    st.subheader("Leading & Lagging Indicators")
-    lagging = indicators.get_lagging_indicators(data)
-    leading = indicators.get_leading_indicators(data)
-    
-    def format_metric_value(key, value):
-        """Format metric values based on their type and key."""
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "N/A"
-            
-        if isinstance(value, (int, float)):
-            # Format based on metric type
-            if 'Revenue' in key and 'vs_' not in key:  # Only format actual revenue values as currency
-                return f"${value:,.0f}"
-            elif 'Satisfaction' in key and 'vs_' not in key:  # Raw satisfaction score
-                return f"{value:.1f}"
-            elif 'NPS' in key and 'vs_' not in key:  # Raw NPS score
-                return f"{value:.1f}"
-            elif any(x in key for x in ['Ratio', 'vs_Target', 'vs_Stretch']):
-                return f"{value:.1f}%"
-            elif 'Time' in key:
-                return f"{value:.0f} days"
-            elif 'Count' in key or 'Number' in key:
-                return f"{value:,.0f}"
-            else:
-                return f"{value:,.2f}"
-        elif isinstance(value, dict):
-            if not value:
-                return "N/A"
-            # For dictionary values, show a summary
-            if all(k in value for k in ['mean', 'median']):
-                try:
-                    mean_val = float(value['mean'])
-                    median_val = float(value['median'])
-                    return f"Avg: {mean_val:.0f}, Med: {median_val:.0f}"
-                except (ValueError, TypeError):
-                    return "N/A"
-            return str(next(iter(value.values())))
-        elif isinstance(value, list):
-            if not value:
-                return "0"
-            return f"{len(value)} items"
-        else:
-            return str(value)
-    
-    def format_metric_delta(key, value):
-        """Format metric delta values based on their type and key."""
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return None
-            
-        if isinstance(value, (int, float)):
-            if 'Revenue_vs_Target' in key:
-                return f"{value:.1f}% of ${strategic_targets.REVENUE_TARGET:,.0f} target"
-            elif 'Revenue_vs_Stretch' in key:
-                return f"{value:.1f}% of ${strategic_targets.REVENUE_STRETCH_GOAL:,.0f} stretch goal"
-            elif 'Customer NPS_vs_Target' in key:
-                return f"{value:.1f}% of {strategic_targets.CUSTOMER_NPS_TARGET} target"
-            elif 'Employee Satisfaction_vs_Target' in key:
-                return f"{value:.1f}% of {strategic_targets.EMPLOYEE_PULSE_TARGET} target"
-            elif 'Ratio' in key:
-                return f"{value:.1f}× target"
-            elif 'Count' in key or 'Number' in key:
-                return f"{value:,.0f} total"
-        return None
-    
-    def get_metric_class(key, value):
-        """Determine if metric is above or below target."""
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return ""
-            
-        if isinstance(value, (int, float)):
-            if 'Revenue_vs_Target' in key or 'Customer NPS_vs_Target' in key or 'Employee Satisfaction_vs_Target' in key:
-                return "above-target" if value >= 100 else "below-target"
-        return ""
-    
-    # Display Lagging Indicators
-    st.markdown("#### Lagging Indicators")
-    
-    # Create three columns for lagging indicators
-    lag_cols = st.columns(3)
-    
-    # Revenue Card
-    with lag_cols[0]:
-        revenue_value = format_metric_value('Revenue', lagging['Revenue'])
-        revenue_delta = format_metric_delta('Revenue_vs_Target', lagging['Revenue_vs_Target'])
-        revenue_class = get_metric_class('Revenue_vs_Target', lagging['Revenue_vs_Target'])
-        st.markdown(f"""
-            <div class="metric-card {revenue_class}">
-                <div class="metric-title">Revenue</div>
-                <div class="metric-value">{revenue_value}</div>
-                <div class="metric-delta">{revenue_delta or ''}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Customer NPS Card
-    with lag_cols[1]:
-        nps_value = format_metric_value('Customer NPS', lagging['Customer NPS'])
-        nps_delta = format_metric_delta('Customer NPS_vs_Target', lagging['Customer NPS_vs_Target'])
-        nps_class = get_metric_class('Customer NPS_vs_Target', lagging['Customer NPS_vs_Target'])
-        st.markdown(f"""
-            <div class="metric-card {nps_class}">
-                <div class="metric-title">Customer NPS</div>
-                <div class="metric-value">{nps_value}</div>
-                <div class="metric-delta">{nps_delta or ''}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Employee Satisfaction Card
-    with lag_cols[2]:
-        satisfaction_value = format_metric_value('Employee Satisfaction', lagging['Employee Satisfaction'])
-        satisfaction_delta = format_metric_delta('Employee Satisfaction_vs_Target', lagging['Employee Satisfaction_vs_Target'])
-        satisfaction_class = get_metric_class('Employee Satisfaction_vs_Target', lagging['Employee Satisfaction_vs_Target'])
-        st.markdown(f"""
-            <div class="metric-card {satisfaction_class}">
-                <div class="metric-title">Employee Satisfaction</div>
-                <div class="metric-value">{satisfaction_value}</div>
-                <div class="metric-delta">{satisfaction_delta or ''}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Display Leading Indicators
-    st.markdown("#### Leading Indicators")
-    
-    # Create columns for leading indicators
-    lead_cols = st.columns(3)
-    
-    # Pipeline Coverage Card
-    with lead_cols[0]:
-        pipeline_value = format_metric_value('Pipeline Coverage', leading['Pipeline Coverage'])
-        pipeline_ratio = leading['Pipeline Coverage Ratio']
-        pipeline_delta = f"{pipeline_ratio:.1f}× of ${strategic_targets.REVENUE_TARGET:,.0f} target"
-        pipeline_class = get_metric_class('Pipeline Coverage Ratio', pipeline_ratio * 100)
-        st.markdown(f"""
-            <div class="metric-card {pipeline_class}">
-                <div class="metric-title">Pipeline Coverage</div>
-                <div class="metric-value">${leading['Pipeline Coverage']:,.0f}</div>
-                <div class="metric-delta">{pipeline_delta}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Deal Cycle Time Card
-    with lead_cols[1]:
-        cycle_time = leading.get('Avg Deal Cycle Time')
-        cycle_time_value = format_metric_value('Avg Deal Cycle Time', cycle_time)
-        st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-title">Deal Cycle Time (Avg)</div>
-                <div class="metric-value">{cycle_time_value}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Next Deal Gap Card
-    with lead_cols[2]:
-        next_deal_gap = leading.get('Avg Next Deal Gap')
-        next_deal_value = format_metric_value('Avg Next Deal Gap', next_deal_gap)
-        st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-title">Time Between Project End and Next Deal Discussion (Avg)</div>
-                <div class="metric-value">{next_deal_value}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Second row of leading indicators
-    lead_cols2 = st.columns(2)
-    
-    # Sponsor Check-ins Card
-    with lead_cols2[0]:
-        checkins = leading.get('Recent Meaningful Check-ins', 0)
-        checkins_pct = leading.get('Recent Meaningful Check-ins %', 0)
-        checkins_value = f"{checkins} of {len(data['Project Inventory'])}"
-        st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-title">Meaningful Sponsor Check-ins (Last 30 Days)</div>
-                <div class="metric-value">{checkins_value}</div>
-                <div class="metric-delta">{checkins_pct:.1f}%</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Green Project Ratio Card
-    with lead_cols2[1]:
-        green_ratio = leading.get('Green Project Ratio', 0)
-        green_ratio_delta = f"{green_ratio * 100:.1f}% of {strategic_targets.GREEN_PROJECT_TARGET * 100}% target"
-        green_class = get_metric_class('Green Project Ratio', green_ratio * 100)
-        st.markdown(f"""
-            <div class="metric-card {green_class}">
-                <div class="metric-title">Green Project Ratio</div>
-                <div class="metric-value">{green_ratio * 100:.1f}%</div>
-                <div class="metric-delta">{green_ratio_delta}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Top 3 Action Items (AI)
-    st.markdown("---")
-    st.subheader("Top 3 Action Items for Today (AI-Powered)")
-    # Only generate Top 3 items if they haven't been generated yet
-    if 'top3_items' not in st.session_state:
-        # Prepare data context (full data for OpenAI)
-        data_context = "\n".join([
-            f"{name}:\n" + df.to_string(index=False) for name, df in data.items() if not df.empty
-        ])
-        if openai_client:
-            with st.spinner("Analyzing data and generating action items..."):
-                st.session_state.top3_items = indicators.get_top3_action_items(data, openai_client, data_context)
-        else:
-            st.warning("OpenAI API key not configured.")
-    # Display the stored Top 3 items
-    if 'top3_items' in st.session_state:
-        st.markdown(st.session_state.top3_items)
-
-    st.subheader("Project & Pipeline Scoring Insights")
-    lagging = indicators.get_lagging_indicators(data)
-    leading = indicators.get_leading_indicators(data)
-    # --- Project Health Score Metrics ---
-    st.markdown("#### Project Health Score Metrics")
-    phs_avg = lagging.get('Avg Project Health Score')
-    phs_median = lagging.get('Median Project Health Score')
-    phs_bands = lagging.get('Project Health Score Bands %')
-    top_project = lagging.get('Top Project by Health Score')
-    bottom_project = lagging.get('Bottom Project by Health Score')
-    cols = st.columns(4)
-    with cols[0]:
-        st.metric("Avg Health Score", f"{phs_avg:.1f}" if phs_avg is not None else "N/A")
-    with cols[1]:
-        st.metric("Median Health Score", f"{phs_median:.1f}" if phs_median is not None else "N/A")
-    with cols[2]:
-        if phs_bands:
-            st.write("Score Bands:")
-            for band, pct in phs_bands.items():
-                st.write(f"{band}: {pct:.1f}%")
-    with cols[3]:
-        st.write(f"Top: {top_project if top_project else 'N/A'}")
-        st.write(f"Bottom: {bottom_project if bottom_project else 'N/A'}")
-    # --- Total Project Score Metrics ---
-    st.markdown("#### Total Project Score Metrics")
-    tps_avg = lagging.get('Avg Total Project Score')
-    tps_median = lagging.get('Median Total Project Score')
-    tps_bands = lagging.get('Total Project Score Bands %')
-    top_tps = lagging.get('Top Project by Total Score')
-    bottom_tps = lagging.get('Bottom Project by Total Score')
-    cols_tps = st.columns(4)
-    with cols_tps[0]:
-        st.metric("Avg Total Project Score", f"{tps_avg:.1f}" if tps_avg is not None else "N/A")
-    with cols_tps[1]:
-        st.metric("Median Total Project Score", f"{tps_median:.1f}" if tps_median is not None else "N/A")
-    with cols_tps[2]:
-        if tps_bands:
-            st.write("Score Bands:")
-            for band, pct in tps_bands.items():
-                st.write(f"{band}: {pct:.1f}%")
-    with cols_tps[3]:
-        st.write(f"Top: {top_tps if top_tps else 'N/A'}")
-        st.write(f"Bottom: {bottom_tps if bottom_tps else 'N/A'}")
-    # --- Pipeline Score Metrics ---
-    st.markdown("#### Pipeline Score Metrics")
-    pls_avg = leading.get('Avg Pipeline Score')
-    pls_median = leading.get('Median Pipeline Score')
-    pls_bands = leading.get('Pipeline Score Bands %')
-    top_pipeline = leading.get('Top Pipeline by Score')
-    bottom_pipeline = leading.get('Bottom Pipeline by Score')
-    cols2 = st.columns(4)
-    with cols2[0]:
-        st.metric("Avg Pipeline Score", f"{pls_avg:.1f}" if pls_avg is not None else "N/A")
-    with cols2[1]:
-        st.metric("Median Pipeline Score", f"{pls_median:.1f}" if pls_median is not None else "N/A")
-    with cols2[2]:
-        if pls_bands:
-            st.write("Score Bands:")
-            for band, pct in pls_bands.items():
-                st.write(f"{band}: {pct:.1f}%")
-    with cols2[3]:
-        st.write(f"Top: {top_pipeline if top_pipeline else 'N/A'}")
-        st.write(f"Bottom: {bottom_pipeline if bottom_pipeline else 'N/A'}")
-    # --- Total Deal Score Metrics ---
-    st.markdown("#### Total Deal Score Metrics")
-    tds_avg = leading.get('Avg Total Deal Score')
-    tds_median = leading.get('Median Total Deal Score')
-    tds_bands = leading.get('Total Deal Score Bands %')
-    top_tds = leading.get('Top Pipeline by Total Score')
-    bottom_tds = leading.get('Bottom Pipeline by Total Score')
-    cols_tds = st.columns(4)
-    with cols_tds[0]:
-        st.metric("Avg Total Deal Score", f"{tds_avg:.1f}" if tds_avg is not None else "N/A")
-    with cols_tds[1]:
-        st.metric("Median Total Deal Score", f"{tds_median:.1f}" if tds_median is not None else "N/A")
-    with cols_tds[2]:
-        if tds_bands:
-            st.write("Score Bands:")
-            for band, pct in tds_bands.items():
-                st.write(f"{band}: {pct:.1f}%")
-    with cols_tds[3]:
-        st.write(f"Top: {top_tds if top_tds else 'N/A'}")
-        st.write(f"Bottom: {bottom_tds if bottom_tds else 'N/A'}")
-    # --- Score Distribution Visualizations ---
-    st.markdown("#### Score Distributions")
-    project_df = data.get('Project Inventory')
-    pipeline_df = data.get('Pipeline')
-    if project_df is not None and not project_df.empty and 'Project Health Score' in project_df.columns:
-        scores = pd.to_numeric(project_df['Project Health Score'], errors='coerce').dropna()
-        fig = px.histogram(scores, nbins=10, title="Project Health Score Distribution", labels={'value': 'Health Score'})
-        st.plotly_chart(fig, use_container_width=True)
-    if project_df is not None and not project_df.empty and 'Total Project Score' in project_df.columns:
-        scores = pd.to_numeric(project_df['Total Project Score'], errors='coerce').dropna()
-        fig = px.histogram(scores, nbins=10, title="Total Project Score Distribution", labels={'value': 'Total Project Score'})
-        st.plotly_chart(fig, use_container_width=True)
-    if pipeline_df is not None and not pipeline_df.empty and 'Pipeline Score' in pipeline_df.columns:
-        scores = pd.to_numeric(pipeline_df['Pipeline Score'], errors='coerce').dropna()
-        fig = px.histogram(scores, nbins=10, title="Pipeline Score Distribution", labels={'value': 'Pipeline Score'})
-        st.plotly_chart(fig, use_container_width=True)
-    if pipeline_df is not None and not pipeline_df.empty and 'Total Deal Score' in pipeline_df.columns:
-        scores = pd.to_numeric(pipeline_df['Total Deal Score'], errors='coerce').dropna()
-        fig = px.histogram(scores, nbins=10, title="Total Deal Score Distribution", labels={'value': 'Total Deal Score'})
-        st.plotly_chart(fig, use_container_width=True)
-
-def render_strategic_targets_section(data):
-    """Render the strategic targets and leading indicators section."""
-    st.header("🎯 Strategic Targets & Leading Indicators")
-    
-    # Get indicators
-    lagging_indicators = indicators.get_lagging_indicators(data)
-    leading_indicators = indicators.get_leading_indicators(data)
-    
-    # Create three columns for the summary tiles
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # Revenue Progress
-        if lagging_indicators['Revenue'] is not None:
-            st.metric(
-                "Revenue Progress",
-                f"${lagging_indicators['Revenue']:,.0f}",
-                f"{lagging_indicators['Revenue_vs_Target']:.1f}% of Target"
-            )
-        
-        # Pipeline Coverage
-        if leading_indicators['Pipeline Coverage'] is not None:
-            st.metric(
-                "Pipeline Coverage",
-                f"${leading_indicators['Pipeline Coverage']:,.0f}",
-                f"{leading_indicators['Pipeline Coverage Ratio']:.1f}× Target"
-            )
-    
-    with col2:
-        # Green Project Ratio
-        if leading_indicators['Green Project Ratio'] is not None:
-            st.metric(
-                "Green Projects",
-                f"{leading_indicators['Green Project Ratio']*100:.1f}%",
-                f"{leading_indicators['Green Project Ratio_vs_Target']:.1f}% of Target"
-            )
-        
-        # Deal Cycle Time
-        if leading_indicators['Avg Deal Cycle Time'] is not None:
-            st.metric(
-                "Avg Deal Cycle Time",
-                f"{leading_indicators['Avg Deal Cycle Time']:.0f} days",
-                f"Median: {leading_indicators['Median Deal Cycle Time']:.0f} days"
-            )
-    
-    with col3:
-        # eNPS Score
-        if lagging_indicators['Customer NPS'] is not None:
-            st.metric(
-                "Customer eNPS",
-                f"{lagging_indicators['Customer NPS']:.1f}",
-                f"{lagging_indicators['Customer NPS_vs_Target']:.1f}% of Target"
-            )
-        
-        # Sponsor Check-ins
-        if leading_indicators['Recent Meaningful Check-ins %'] is not None:
-            st.metric(
-                "Recent Sponsor Check-ins",
-                f"{leading_indicators['Recent Meaningful Check-ins']} of {len(data['Project Inventory'])}",
-                f"{leading_indicators['Recent Meaningful Check-ins %']:.1f}%"
-            )
-    
-    # Detailed Metrics Section
-    st.subheader("📊 Detailed Metrics")
-    
-    # Create tabs for different metric categories
-    tab1, tab2, tab3 = st.tabs(["Pipeline & Deals", "Project Health", "Action Items"])
-    
-    with tab1:
-        # Pipeline and Deal Metrics
-        st.write("#### Pipeline Coverage")
-        if leading_indicators['Pipeline Coverage'] is not None:
-            st.write(f"Total Pipeline: ${leading_indicators['Pipeline Coverage']:,.0f}")
-            st.write(f"Coverage Ratio: {leading_indicators['Pipeline Coverage Ratio']:.1f}× Target")
-        
-        st.write("#### Deal Cycle Analysis")
-        if leading_indicators['Deal Cycle Time by Tier'] is not None:
-            st.write("Deal Cycle Time by Pursuit Tier:")
-            for tier, times in leading_indicators['Deal Cycle Time by Tier'].items():
-                st.write(f"- {tier}: Avg {times.get('mean', 0):.0f} days, Median {times.get('median', 0):.0f} days")
-        
-        st.write("#### Next Deal Discussions")
-        if leading_indicators['Overdue Next Deal Projects'] is not None:
-            st.write("Projects Overdue for Next Deal Discussion:")
-            for project in leading_indicators['Overdue Next Deal Projects']:
-                st.write(f"- {project['Project Name']}: {project['Next Deal Gap']} days since project end")
-    
-    with tab2:
-        # Project Health Metrics
-        st.write("#### Project Status")
-        if leading_indicators['Non-Green Projects'] is not None:
-            st.write("Projects Not Meeting Green Status:")
-            for project in leading_indicators['Non-Green Projects']:
-                st.write(f"- {project['Project Name']} ({project['Status (R/Y/G)']}): {project['Key Issues']}")
-        
-        st.write("#### Sponsor Check-ins")
-        if leading_indicators['Overdue Check-in Projects'] is not None:
-            st.write("Projects Overdue for Sponsor Check-in:")
-            for project in leading_indicators['Overdue Check-in Projects']:
-                st.write(f"- {project['Project Name']}: Last check-in {project['Last Sponsor Checkin Date']}")
-    
-    with tab3:
-        # Action Items
-        st.write("#### Top Action Items")
-        action_items = indicators.get_top3_action_items(data, st.session_state.openai_client, str(data))
-        st.write(action_items)
-
-def render_dashboard():
-    """Render the main dashboard."""
-    # Add CSS for metric boxes
-    st.markdown("""
-        <style>
-        .metric-box {
-            background-color: #f0f2f6;
+            border-radius: 8px;
             padding: 20px;
-            border-radius: 5px;
-            margin: 10px 0;
+            margin-bottom: 10px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.04);
+            transition: all 0.3s ease-in-out;
         }
-        </style>
-    """, unsafe_allow_html=True)
-    
-    # Load data
-    data = st.session_state.data
-    if not data:
-        st.error("Failed to load data. Please check your connection and try again.")
-        return
-    
-    # Render strategic targets section
-    render_strategic_targets_section(data)
-    
-    # Render other dashboard sections
-    render_homepage(data, st.session_state.openai_client)
+        .metric-card:hover {
+            box-shadow: 0 6px 12px rgba(0,0,0,0.08);
+        }
+        .metric-card-title {
+            font-size: 0.95em;
+            color: #4A5568; 
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        .metric-card-value {
+            font-size: 1.8em;
+            font-weight: 700;
+            color: #1A202C; 
+        }
+        .metric-card-delta {
+            font-size: 0.85em;
+            color: #718096; 
+        }
+        .metric-card-delta .positive { color: #38A169; }
+        .metric-card-delta .negative { color: #E53E3E; }
+        .metric-card.good { border-left: 5px solid #48BB78; } 
+        .metric-card.warning { border-left: 5px solid #ECC94B; } 
+        .metric-card.danger { border-left: 5px solid #F56565; } 
 
-def escape_markdown(text):
-    # Escape underscores and asterisks
-    text = re.sub(r'([_*])', r'\\\1', text)
-    return text
+        /* Section headers */
+        .section-header {
+            font-size: 1.5em;
+            font-weight: 600;
+            color: #2D3748; 
+            margin-top: 20px;
+            margin-bottom: 15px;
+            border-bottom: 2px solid #CBD5E0; 
+            padding-bottom: 5px;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-def answer_critical_question(user_question, data):
-    """Answer critical questions directly without using OpenAI"""
-    q = user_question.lower().strip()
-    project_df = data.get('Project Inventory')
-    pipeline_df = data.get('Pipeline')
-    risk_df = data.get('Project Risks')
-    util_df = data.get('Team Utilization')
-    exec_df = data.get('Executive Activity')
-    
-    # Clean up dataframes as needed
-    if project_df is not None and not project_df.empty:
-        project_df = project_df.copy()
-        # Clean and convert Revenue column properly
-        project_df['Revenue'] = project_df['Revenue'].astype(str).str.replace('$', '').str.replace(',', '').str.strip()
-        project_df['Revenue'] = pd.to_numeric(project_df['Revenue'], errors='coerce').fillna(0)
-        project_df['Margin'] = project_df['Margin'].astype(str).str.replace('%', '').str.strip()
-        project_df['Margin'] = pd.to_numeric(project_df['Margin'], errors='coerce').fillna(0)
-    
-    if pipeline_df is not None and not pipeline_df.empty:
-        pipeline_df = pipeline_df.copy()
-        pipeline_df['Percieved Annual AMO'] = pipeline_df['Percieved Annual AMO'].astype(str).str.replace('$', '').str.replace(',', '').str.strip()
-        pipeline_df['Percieved Annual AMO'] = pd.to_numeric(pipeline_df['Percieved Annual AMO'], errors='coerce').fillna(0)
-    
-    if risk_df is not None and not risk_df.empty:
-        risk_df = risk_df.copy()
-        risk_df['Impact ($)'] = risk_df['Impact ($)'].astype(str).str.replace('$', '').str.replace(',', '')
-        risk_df['Impact ($)'] = pd.to_numeric(risk_df['Impact ($)'], errors='coerce').fillna(0)
-        risk_df['Severity'] = risk_df['Severity'].fillna('')
-    
-    if util_df is not None and not util_df.empty:
-        util_df = util_df.copy()
-        util_df['Utilization (%)'] = util_df['Utilization (%)'].astype(str).str.replace('%', '')
-        util_df['Utilization (%)'] = pd.to_numeric(util_df['Utilization (%)'], errors='coerce').fillna(0)
-    
-    if exec_df is not None and not exec_df.empty:
-        exec_df = exec_df.copy()
-        exec_df['Strategic Cost ($)'] = exec_df['Strategic Cost ($)'].astype(str).str.replace('$', '').str.replace(',', '')
-        exec_df['Strategic Cost ($)'] = pd.to_numeric(exec_df['Strategic Cost ($)'], errors='coerce').fillna(0)
-
-    # 1. Most valuable project
-    if re.search(r"most (valuable|revenue|expensive) project", q):
-        if project_df is not None and not project_df.empty:
-            # Sort by Revenue in descending order to verify
-            sorted_df = project_df.sort_values('Revenue', ascending=False)
-            top_project = sorted_df.iloc[0]  # Get the first row after sorting
-            return f'The project with the most revenue is "{top_project["Project Name"]}" with a revenue of ${top_project["Revenue"]:,.2f}.'
-    
-    # 2. Least valuable project
-    if re.search(r"least (valuable|revenue|expensive) project", q):
-        if project_df is not None and not project_df.empty:
-            low_project = project_df.loc[project_df['Revenue'].idxmin()]
-            return f'The project with the least revenue is "{low_project["Project Name"]}" with a revenue of ${low_project["Revenue"]:,.2f}.'
-    
-    # 3. Total revenue
-    if re.search(r"total revenue", q):
-        if project_df is not None and not project_df.empty:
-            return f'The total revenue is ${project_df["Revenue"].sum():,.2f}.'
-    
-    # 4. Average project revenue
-    if re.search(r"average (project )?revenue", q):
-        if project_df is not None and not project_df.empty:
-            return f'The average project revenue is ${project_df["Revenue"].mean():,.2f}.'
-    
-    # 5. How many projects
-    if re.search(r"how many projects", q):
-        if project_df is not None and not project_df.empty:
-            return f'There are {len(project_df)} projects.'
-    
-    # 6. How many red projects
-    if re.search(r"how many red projects", q):
-        if project_df is not None and not project_df.empty:
-            red_count = (project_df['Status (R/Y/G)'].str.strip().str.lower() == 'red').sum()
-            return f'There are {red_count} red projects.'
-    
-    # 7. Total revenue of red projects
-    if re.search(r"red project revenue|revenue of red projects", q):
-        if project_df is not None and not project_df.empty:
-            red_revenue = project_df.loc[project_df['Status (R/Y/G)'].str.strip().str.lower() == 'red', 'Revenue'].sum()
-            return f'The total revenue of red projects is ${red_revenue:,.2f}.'
-    
-    # 8. Average margin
-    if re.search(r"average margin", q):
-        if project_df is not None and not project_df.empty:
-            return f'The average project margin is {project_df["Margin"].mean():.2f}%.'
-    
-    # 9. Highest margin project
-    if re.search(r"highest margin project", q):
-        if project_df is not None and not project_df.empty:
-            top_margin = project_df.loc[project_df['Margin'].idxmax()]
-            return f'The project with the highest margin is "{top_margin["Project Name"]}" with a margin of {top_margin["Margin"]:.2f}%.'
-    
-    # 10. Lowest margin project
-    if re.search(r"lowest margin project", q):
-        if project_df is not None and not project_df.empty:
-            low_margin = project_df.loc[project_df['Margin'].idxmin()]
-            return f'The project with the lowest margin is "{low_margin["Project Name"]}" with a margin of {low_margin["Margin"]:.2f}%.'
-    
-    # 11. Total pipeline value
-    if re.search(r"total pipeline", q):
-        if pipeline_df is not None and not pipeline_df.empty:
-            return f'The total pipeline value is ${pipeline_df["Percieved Annual AMO"].sum():,.2f}.'
-    
-    # 12. Pipeline health metrics
-    if re.search(r"pipeline health|deal registration|roadmap|business case|sponsor", q):
-        if pipeline_df is not None and not pipeline_df.empty:
-            deal_registered = len(pipeline_df[pipeline_df['Deal Registered YN'].str.lower() == 'y'])
-            has_roadmap = len(pipeline_df[pipeline_df['Agreed Upon Roadmap YN'].str.lower() == 'y'])
-            has_business_case = len(pipeline_df[pipeline_df['Business Case_ROI YN'].str.lower() == 'y'])
-            has_sponsor = len(pipeline_df[pipeline_df['Business Sponsor YN'].str.lower() == 'y'])
-            return f'Pipeline Health:\n- {deal_registered} deals registered\n- {has_roadmap} deals with roadmap\n- {has_business_case} deals with business case\n- {has_sponsor} deals with sponsor'
-    
-    # 13. Total at-risk revenue
-    if re.search(r"at[- ]?risk revenue", q):
-        if risk_df is not None and not risk_df.empty:
-            at_risk = risk_df.loc[risk_df['Severity'].str.lower() == 'high', 'Impact ($)'].sum()
-            return f'The total at-risk revenue is ${at_risk:,.2f}.'
-    
-    # 14. How many high-risk items
-    if re.search(r"how many high[- ]?risk", q):
-        if risk_df is not None and not risk_df.empty:
-            high_risk_count = (risk_df['Severity'].str.lower() == 'high').sum()
-            return f'There are {high_risk_count} high-risk items.'
-    
-    # 15. Total strategic cost
-    if re.search(r"strategic cost", q):
-        if exec_df is not None and not exec_df.empty:
-            return f'The total strategic cost is ${exec_df["Strategic Cost ($)"].sum():,.2f}.'
-    
-    # 16. Average executive utilization
-    if re.search(r"average executive utilization", q):
-        if util_df is not None and not util_df.empty:
-            exec_mask = util_df['Role'].str.contains('Executive', case=False, na=False)
-            avg_exec = util_df.loc[exec_mask, 'Utilization (%)'].mean()
-            return f'The average executive utilization is {avg_exec:.1f}%.'
-    
-    # 17. Average delivery utilization
-    if re.search(r"average delivery utilization", q):
-        if util_df is not None and not util_df.empty:
-            deliv_mask = ~util_df['Role'].str.contains('Executive', case=False, na=False)
-            avg_deliv = util_df.loc[deliv_mask, 'Utilization (%)'].mean()
-            return f'The average delivery team utilization is {avg_deliv:.1f}%.'
-    
-    # 18. Over-utilized execs
-    if re.search(r"over[- ]?utilized exec", q):
-        if util_df is not None and not util_df.empty:
-            exec_mask = util_df['Role'].str.contains('Executive', case=False, na=False)
-            over_util = (util_df.loc[exec_mask, 'Utilization (%)'] > 70).sum()
-            return f'There are {over_util} over-utilized executives (over 70% utilized).'
-    
-    # 19. Under-utilized delivery
-    if re.search(r"under[- ]?utilized delivery", q):
-        if util_df is not None and not util_df.empty:
-            deliv_mask = ~util_df['Role'].str.contains('Executive', case=False, na=False)
-            under_util = (util_df.loc[deliv_mask, 'Utilization (%)'] < 70).sum()
-            return f'There are {under_util} under-utilized delivery team members (under 70% utilized).'
-    
-    # 20. Total risk impact
-    if re.search(r"total risk impact", q):
-        if risk_df is not None and not risk_df.empty:
-            return f'The total risk impact is ${risk_df["Impact ($)"].sum():,.2f}.'
-    
-    return None
-
-def render_ai_assistant(data):
-    """Render the AI assistant in the sidebar"""
-    st.sidebar.title("🤖 AI Assistant")
-    st.sidebar.write("Ask questions about the data in natural language")
-    # Initialize session state for the question if it doesn't exist
+# --- Session State Initialization ---
+def init_session_state():
+    if 'data_loaded' not in st.session_state:
+        st.session_state.data_loaded = False
+    if 'all_data' not in st.session_state:
+        st.session_state.all_data = {}
+    if 'indicators' not in st.session_state:
+        st.session_state.indicators = {}
+    if 'openai_client' not in st.session_state:
+        try:
+            st.session_state.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        except Exception as e:
+            st.session_state.openai_client = None
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = "🏠 Home" 
     if 'ai_question' not in st.session_state:
         st.session_state.ai_question = ""
-    # Create a form for the question input and send button
-    with st.sidebar.form(key="ai_assistant_form"):
-        user_question = st.text_input("Your question:", value=st.session_state.ai_question)
-        send_button = st.form_submit_button("Send")
-    # Only process the question if the send button was clicked
-    if send_button and user_question:
-        # Store the question in session state
-        st.session_state.ai_question = user_question
-        # Prepare data context (full data for OpenAI)
-        data_context = "\n".join([
-            f"{name}:\n" + df.to_string(index=False) for name, df in data.items() if not df.empty
-        ])
-        # Intercept and answer critical questions
-        py_answer = answer_critical_question(user_question, data)
-        if py_answer:
-            st.sidebar.success(py_answer)
+    if 'ai_chat_history' not in st.session_state:
+        st.session_state.ai_chat_history = []
+    
+    # For contextual editing flow
+    if 'selected_project_to_edit' not in st.session_state: 
+        st.session_state.selected_project_to_edit = None
+    if 'selected_pipeline_to_edit' not in st.session_state: 
+        st.session_state.selected_pipeline_to_edit = None
+    if 'manage_data_entity_type' not in st.session_state: 
+        st.session_state.manage_data_entity_type = "Project" 
+    if 'initial_load_complete' not in st.session_state:
+        st.session_state.initial_load_complete = False
+
+
+# --- Data Loading and Processing ---
+@st.cache_resource(ttl=300) 
+def setup_google_sheets_cached():
+    credentials_file = os.getenv('GOOGLE_SHEETS_CREDENTIALS_FILE')
+    sheet_name = os.getenv('GOOGLE_SHEET_NAME')
+
+    if not credentials_file or not os.path.exists(credentials_file):
+        st.error(f"Credentials file not found: {credentials_file}")
+        return None
+    if not sheet_name:
+        st.error("GOOGLE_SHEET_NAME not configured in .env file")
+        return None
+
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    credentials = Credentials.from_service_account_file(credentials_file, scopes=scopes)
+    
+    max_retries = 3
+    retry_delay = 5
+    for attempt in range(max_retries):
+        try:
+            gc = gspread.authorize(credentials)
+            sheet = gc.open(sheet_name)
+            sheet.get_worksheet(0) 
+            return sheet
+        except Exception as e:
+            if attempt < max_retries - 1:
+                st.warning(f"GSheets connection attempt {attempt + 1} failed. Retrying in {retry_delay}s... Error: {e}")
+                time.sleep(retry_delay)
+            else:
+                st.error(f"Error accessing spreadsheet after {max_retries} attempts: {e}")
+                return None
+    return None
+
+@st.cache_data(ttl=300) 
+def load_sheet_data_cached(_sheet_resource, worksheet_name): 
+    if _sheet_resource is None: return pd.DataFrame()
+    try:
+        worksheet = _sheet_resource.worksheet(worksheet_name)
+        all_values = worksheet.get_all_values()
+        if not all_values: return pd.DataFrame()
+        
+        df = pd.DataFrame(all_values[1:], columns=all_values[0])
+        df.columns = df.columns.str.strip()
+        df = df.replace('', pd.NA).dropna(how='all')
+        return df
+    except Exception as e:
+        st.warning(f"Error loading worksheet '{worksheet_name}': {e}")
+        return pd.DataFrame()
+
+def load_all_data():
+    if not st.session_state.data_loaded:
+        sheet = setup_google_sheets_cached()
+        if sheet:
+            worksheet_names = [
+                'Project Inventory', 'Project Risks', 'Pipeline', 'Team Utilization',
+                'Talent Gaps', 'Operational Gaps', 'Executive Activity',
+                'Scenario Model Inputs', 'Do Nothing Scenario', 'Proposed Scenario',
+                'Scenario Comparison', 'MappingTable', 'Project Observations'
+            ]
+            progress_bar = st.progress(0, text="Loading data...")
+            for i, name in enumerate(worksheet_names):
+                st.session_state.all_data[name] = load_sheet_data_cached(sheet, name)
+                progress_bar.progress((i + 1) / len(worksheet_names), text=f"Loading {name}...")
+            
+            st.session_state.indicators = indicators.get_all_indicators(st.session_state.all_data)
+            st.session_state.data_loaded = True
+            progress_bar.empty()
+            
+            data_context_parts = []
+            key_sheets_max_rows = {
+                'Project Inventory': 50, 'Pipeline': 50, 'Project Risks': 30
+            }
+            default_max_rows = 15
+
+            for name, df_sheet in st.session_state.all_data.items():
+                if not df_sheet.empty:
+                    current_max_rows = key_sheets_max_rows.get(name, default_max_rows)
+                    col_info = f"Sheet: {name}\nColumns: {', '.join(df_sheet.columns)}\n"
+                    if len(df_sheet) <= current_max_rows:
+                        data_context_parts.append(col_info + df_sheet.to_string(index=False) + "\n")
+                    else:
+                        data_context_parts.append(col_info + df_sheet.head(current_max_rows).to_string(index=False) + f"\n... (showing top {current_max_rows} of {len(df_sheet)} rows)\n")
+            st.session_state.data_context_string = "\n".join(data_context_parts)
+            
+            if not st.session_state.get('initial_load_complete', False): 
+                st.sidebar.success("Data loaded successfully!")
+                st.session_state.initial_load_complete = True
         else:
+            st.error("Failed to connect to Google Sheets. Dashboard may not function correctly.")
+            st.session_state.data_loaded = False
+
+# --- Helper Functions for Display ---
+def format_currency(value, default_na="N/A"):
+    if pd.isna(value) or value is None: return default_na
+    return f"${value:,.0f}"
+
+def format_percentage(value, decimals=1, default_na="N/A"):
+    if pd.isna(value) or value is None: return default_na
+    return f"{value:.{decimals}f}%"
+
+def format_number(value, decimals=0, default_na="N/A"):
+    if pd.isna(value) or value is None: return default_na
+    return f"{value:,.{decimals}f}"
+    
+def get_delta_color_class(value, is_higher_better=True):
+    if pd.isna(value) or value is None or value == 0: return ""
+    if is_higher_better: return "positive" if value > 0 else "negative"
+    else: return "negative" if value > 0 else "positive"
+
+def render_metric_card(title, value, delta=None, delta_label=None, card_class=""):
+    delta_html = ""
+    if delta is not None and delta_label:
+        delta_color_class = "" 
+        delta_html = f"<div class='metric-card-delta {delta_color_class}'>{delta} {delta_label}</div>"
+    st.markdown(f"""
+        <div class="metric-card {card_class}">
+            <div class="metric-card-title">{title}</div>
+            <div class="metric-card-value">{value}</div>
+            {delta_html}
+        </div>
+    """, unsafe_allow_html=True)
+
+# --- AI Assistant Functions ---
+def escape_markdown_for_st(text):
+    if not isinstance(text, str): return text
+    escape_chars = r"([\\`*__{}\[\]()#+-.!])"
+    return re.sub(escape_chars, r"\\\1", text)
+
+def answer_critical_question_custom(user_question, data_kpis):
+    q = user_question.lower().strip()
+    if "total revenue" in q:
+        return f"Total revenue is {format_currency(data_kpis.get('total_revenue', 0))}."
+    if "red project" in q and ("count" in q or "how many" in q) :
+        return f"There are {format_number(data_kpis.get('red_projects_count',0))} red projects."
+    return None
+
+def render_ai_assistant():
+    st.sidebar.subheader("🤖 AI Assistant")
+    if not st.session_state.openai_client:
+        st.sidebar.warning("OpenAI client not initialized. AI Assistant may not function.")
+        return
+
+    for chat in st.session_state.ai_chat_history:
+        with st.sidebar.chat_message(chat["role"]):
+            st.markdown(escape_markdown_for_st(chat["content"]))
+
+    prompt = st.sidebar.chat_input("Ask about your data...", key="ai_chat_input")
+
+    if prompt:
+        st.session_state.ai_chat_history.append({"role": "user", "content": prompt})
+        with st.sidebar.chat_message("user"):
+            st.markdown(escape_markdown_for_st(prompt))
+
+        with st.sidebar.chat_message("assistant"):
+            message_placeholder = st.empty()
             with st.spinner("Thinking..."):
-                response = query_openai(user_question, data_context)
-                st.sidebar.markdown(escape_markdown(response), unsafe_allow_html=False)
+                direct_answer = answer_critical_question_custom(prompt, st.session_state.indicators)
+                
+                if direct_answer:
+                    response_text = direct_answer
+                elif st.session_state.openai_client:
+                    full_prompt = f"""Based on the following healthcare delivery data snapshot:
+                    {st.session_state.get("data_context_string", "No data context available.")}
+                    Question: {prompt}
+                    Please provide a clear, concise answer. If the data is unavailable, say so.
+                    """
+                    try:
+                        completion = st.session_state.openai_client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {"role": "system", "content": "You are a helpful healthcare delivery analytics assistant."},
+                                {"role": "user", "content": full_prompt}
+                            ]
+                        )
+                        response_text = completion.choices[0].message.content
+                    except Exception as e:
+                        response_text = f"Error querying OpenAI: {str(e)}"
+                else:
+                    response_text = "OpenAI client not available. Cannot process this question."
+            
+            message_placeholder.markdown(escape_markdown_for_st(response_text))
+            st.session_state.ai_chat_history.append({"role": "assistant", "content": response_text})
+
+# --- GSheet Update Helper ---
+def update_gsheet_row(worksheet_name, identifier_col_name, identifier_value, update_data_dict):
+    try:
+        sheet = setup_google_sheets_cached()
+        if not sheet:
+            st.error("Failed to connect to Google Sheets for update.")
+            return False
+        
+        worksheet = sheet.worksheet(worksheet_name)
+        header = worksheet.row_values(1) 
+        
+        if identifier_col_name not in header:
+            st.error(f"Identifier column '{identifier_col_name}' not found in sheet '{worksheet_name}'. Update failed.")
+            return False
+            
+        cell = worksheet.find(identifier_value, in_column=header.index(identifier_col_name) + 1)
+        if not cell:
+            st.error(f"Could not find '{identifier_value}' in column '{identifier_col_name}' of sheet '{worksheet_name}'.")
+            return False
+        
+        row_index = cell.row
+        
+        cells_to_update = []
+        for col_name, new_value in update_data_dict.items():
+            if col_name in header:
+                col_index = header.index(col_name) + 1
+                cells_to_update.append(gspread.Cell(row_index, col_index, str(new_value))) 
+            else:
+                st.warning(f"Column '{col_name}' not found in sheet '{worksheet_name}'. Skipping update for this field.")
+        
+        if cells_to_update:
+            worksheet.update_cells(cells_to_update, value_input_option='USER_ENTERED')
+            return True
+        st.info("No valid fields to update were provided.") 
+        return False 
+
+    except gspread.exceptions.APIError as e:
+        st.error(f"Google Sheets API Error updating '{worksheet_name}': {e}")
+        return False
+    except Exception as e:
+        st.error(f"An unexpected error occurred updating Google Sheet '{worksheet_name}': {e}")
+        return False
+
+# --- Page Rendering Functions ---
+def render_home_dashboard():
+    st.title("🏠 Executive Dashboard")
+    kpis = st.session_state.indicators
+
+    st.markdown("<div class='section-header'>Overall Health Snapshot</div>", unsafe_allow_html=True)
+    cols = st.columns(4)
+    with cols[0]:
+        render_metric_card("Total Revenue", format_currency(kpis.get('total_revenue')), 
+                           delta=format_percentage(kpis.get('revenue_vs_target_pct')), 
+                           delta_label="of target", 
+                           card_class="good" if kpis.get('revenue_vs_target_pct', 0) >= 100 else "warning")
+    with cols[1]:
+        render_metric_card("Pipeline Coverage", format_number(kpis.get('pipeline_coverage_ratio'), 1) + "x",
+                           delta=format_percentage(kpis.get('pipeline_coverage_vs_target_pct')), 
+                           delta_label="of target",
+                           card_class="good" if kpis.get('pipeline_coverage_vs_target_pct',0) >=100 else "warning")
+    with cols[2]:
+        render_metric_card("Green Project Ratio", format_percentage(kpis.get('green_project_ratio', 0) * 100), 
+                           delta=format_percentage(kpis.get('green_project_ratio_vs_target_pct')), 
+                           delta_label="of target",
+                           card_class="good" if kpis.get('green_project_ratio_vs_target_pct',0) >=100 else "danger")
+    with cols[3]:
+        render_metric_card("Avg. Customer NPS", format_number(kpis.get('avg_customer_nps'), 1),
+                           delta=format_percentage(kpis.get('customer_nps_vs_target_pct')),
+                           delta_label="of target",
+                           card_class="good" if kpis.get('customer_nps_vs_target_pct',0) >=100 else "warning")
+
+    st.markdown("<div class='section-header'>✨ AI-Powered Top Action Items</div>", unsafe_allow_html=True)
+    if 'ai_top_actions' not in st.session_state or st.button("🔄 Regenerate AI Actions"):
+        with st.spinner("Generating AI Action Items..."):
+            st.session_state.ai_top_actions = indicators.get_top3_action_items(
+                st.session_state.all_data, 
+                st.session_state.openai_client,
+                st.session_state.get("data_context_string", "No data context available.")
+            )
+    if 'ai_top_actions' in st.session_state:
+        ai_actions_content = st.session_state.ai_top_actions
+        if not isinstance(ai_actions_content, str): ai_actions_content = str(ai_actions_content) 
+        st.info(ai_actions_content)
+
+    st.markdown("<div class='section-header'>📉 Lagging Indicators</div>", unsafe_allow_html=True)
+    lag_cols = st.columns(3)
+    with lag_cols[0]:
+        render_metric_card("FY Revenue", format_currency(kpis.get('total_revenue')), 
+                           f"{format_currency(strategic_targets.REVENUE_TARGET)} target",
+                           card_class="good" if kpis.get('revenue_vs_target_pct', 0) >= 100 else "warning")
+    with lag_cols[1]:
+        render_metric_card("Customer NPS (Avg)", format_number(kpis.get('avg_customer_nps'),1),
+                           f"{strategic_targets.CUSTOMER_NPS_TARGET} target",
+                           card_class="good" if kpis.get('customer_nps_vs_target_pct',0) >=100 else "warning")
+    with lag_cols[2]:
+        render_metric_card("Employee Pulse (Avg)", format_number(kpis.get('avg_employee_pulse_score'),1),
+                           f"{strategic_targets.EMPLOYEE_PULSE_TARGET} target",
+                           card_class="good" if kpis.get('employee_pulse_vs_target_pct',0) >=100 else "warning")
+
+    st.markdown("<div class='section-header'>📈 Leading Indicators</div>", unsafe_allow_html=True)
+    lead_cols1 = st.columns(3)
+    with lead_cols1[0]:
+        render_metric_card("Active Pipeline Value", format_currency(kpis.get('active_pipeline_value')),
+                           f"{format_number(kpis.get('pipeline_coverage_ratio'),1)}x coverage",
+                           card_class="good" if kpis.get('pipeline_coverage_vs_target_pct',0) >=100 else "warning")
+    with lead_cols1[1]:
+        render_metric_card("Avg. Deal Cycle", f"{format_number(kpis.get('avg_deal_cycle_time_days'))} days",
+                           f"Median: {format_number(kpis.get('median_deal_cycle_time_days'))} days")
+    with lead_cols1[2]:
+         render_metric_card("Green Project Ratio", format_percentage(kpis.get('green_project_ratio', 0) * 100),
+                           f"{format_percentage(strategic_targets.GREEN_PROJECT_TARGET*100)} target",
+                           card_class="good" if kpis.get('green_project_ratio_vs_target_pct',0) >=100 else "danger")
+    
+    lead_cols2 = st.columns(3)
+    with lead_cols2[0]:
+        render_metric_card("Recent Sponsor Check-ins", f"{format_number(kpis.get('recent_meaningful_checkins_count'))} ({format_percentage(kpis.get('recent_meaningful_checkins_pct'))})",
+                            f"{kpis.get('overdue_sponsor_checkin_count')} overdue")
+    with lead_cols2[1]:
+        render_metric_card("High Severity Risks", f"{format_number(kpis.get('high_severity_risk_count'))}",
+                           f"{format_currency(kpis.get('high_severity_risk_impact'))} impact")
+    with lead_cols2[2]:
+        render_metric_card("Avg. Delivery Utilization", format_percentage(kpis.get('avg_delivery_utilization_pct')),
+                           f"{kpis.get('under_utilized_delivery_count')} under-utilized")
+
+def render_projects_page():
+    st.title("📊 Projects Deep Dive")
+    kpis = st.session_state.indicators
+    project_df_original = st.session_state.all_data.get('Project Inventory', pd.DataFrame())
+
+    st.markdown("<div class='section-header'>Project Health Overview</div>", unsafe_allow_html=True)
+    cols = st.columns(4)
+    with cols[0]: st.metric("Total Projects", format_number(kpis.get('total_projects')))
+    with cols[1]: st.metric("Red Projects", format_number(kpis.get('red_projects_count')), delta=f"{format_currency(kpis.get('red_project_revenue'))} at risk", delta_color="inverse")
+    with cols[2]: st.metric("Avg. Health Score", format_number(kpis.get('avg_project_health_score'), 1), f"Median: {format_number(kpis.get('median_project_health_score'),1)}")
+    with cols[3]: st.metric("Avg. Total Score", format_number(kpis.get('avg_total_project_score'), 1), f"Median: {format_number(kpis.get('median_total_project_score'),1)}")
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 All Projects", "🚨 At-Risk Projects", "🏆 Score Analysis", "📅 Sponsor Check-ins"])
+
+    with tab1:
+        st.subheader("All Projects List")
+        if not project_df_original.empty and 'Project Name' in project_df_original.columns:
+            display_df = project_df_original.copy()
+            if 'Revenue' in display_df.columns: display_df['Revenue'] = indicators.safe_to_numeric(display_df['Revenue']).apply(lambda x: f"${x:,.0f}")
+            if 'Project Health Score' in display_df.columns: display_df['Project Health Score'] = indicators.safe_to_numeric(display_df['Project Health Score']).round(1)
+            
+            display_cols = ['Project Name', 'Client', 'Status (R/Y/G)', 'Revenue', 'Project Health Score', 'Project End Date', 'Key Issues']
+            final_cols = [col for col in display_cols if col in display_df.columns]
+            st.dataframe(display_df[final_cols], use_container_width=True, height=400) # Reduced height
+            
+            st.markdown("---")
+            st.subheader("Edit Project Details")
+            project_names_for_edit = [""] + sorted(project_df_original['Project Name'].astype(str).unique().tolist())
+            selected_project_name_for_action = st.selectbox(
+                "Select a project to edit:", project_names_for_edit, index=0, key="project_action_selector"
+            )
+            if selected_project_name_for_action:
+                if st.button(f"✏️ Edit '{selected_project_name_for_action}'", key=f"edit_proj_{selected_project_name_for_action.replace(' ','_')}"): # Unique key for button
+                    st.session_state.selected_project_to_edit = selected_project_name_for_action
+                    st.session_state.manage_data_entity_type = "Project" # Set type for Manage Data page
+                    st.session_state.current_page = "📝 Manage Data"
+                    st.experimental_rerun()
+        else: st.info("No project data or 'Project Name' column available.")
+            
+    with tab2:
+        st.subheader("At-Risk & Non-Green Projects")
+        if not project_df_original.empty and 'Status (R/Y/G)' in project_df_original.columns:
+            project_df_original_status_copy = project_df_original.copy() # Work on a copy for modification
+            project_df_original_status_copy['Status (R/Y/G)'] = project_df_original_status_copy['Status (R/Y/G)'].astype(str).str.upper()
+            at_risk_df = project_df_original_status_copy[project_df_original_status_copy['Status (R/Y/G)'].isin(['R', 'Y'])].copy()
+            if not at_risk_df.empty:
+                display_at_risk_cols = ['Project Name', 'Status (R/Y/G)', 'Revenue', 'Key Issues', 'Next Steps', 'Executive Support Required']
+                final_at_risk_cols = [col for col in display_at_risk_cols if col in at_risk_df.columns]
+                if 'Revenue' in final_at_risk_cols:
+                     at_risk_df['RevenueNum'] = indicators.safe_to_numeric(at_risk_df['Revenue'])
+                     at_risk_df['Revenue'] = at_risk_df['RevenueNum'].apply(lambda x: f"${x:,.0f}")
+                st.dataframe(at_risk_df[final_at_risk_cols], use_container_width=True)
+            else: st.success("🎉 No projects currently marked Red or Yellow!")
+        else: st.info("No project data or 'Status (R/Y/G)' column available to determine at-risk projects.")
+        st.subheader("Non-Green Projects (from indicators module)")
+        non_green_list = kpis.get('non_green_projects_list', [])
+        if non_green_list: st.table(pd.DataFrame(non_green_list))
+        else: st.success("🎉 All projects are Green according to ratio calculation (or data unavailable)!")
+
+    with tab3:
+        st.subheader("Project Score Analysis")
+        col_score1, col_score2 = st.columns(2)
+        project_df_for_scores = project_df_original.copy() 
+        with col_score1:
+            if 'Project Health Score' in project_df_for_scores.columns and not project_df_for_scores['Project Health Score'].dropna().empty:
+                project_df_for_scores['Project Health Score Num'] = indicators.safe_to_numeric(project_df_for_scores['Project Health Score'])
+                fig_health = px.histogram(project_df_for_scores.dropna(subset=['Project Health Score Num']), x='Project Health Score Num', title='Project Health Score Distribution', nbins=10, text_auto=True)
+                fig_health.update_layout(bargap=0.1); st.plotly_chart(fig_health, use_container_width=True)
+            else: st.info("Project Health Score data not available for distribution chart.")
+            st.write(f"Top Project (Health Score): **{kpis.get('top_project_by_health_score', 'N/A')}**")
+            st.write(f"Bottom Project (Health Score): **{kpis.get('bottom_project_by_health_score', 'N/A')}**")
+            st.write("Health Score Bands (%):"); st.json(kpis.get('project_health_score_bands_pct', {}))
+        with col_score2:
+            if 'Total Project Score' in project_df_for_scores.columns and not project_df_for_scores['Total Project Score'].dropna().empty:
+                project_df_for_scores['Total Project Score Num'] = indicators.safe_to_numeric(project_df_for_scores['Total Project Score'])
+                fig_total = px.histogram(project_df_for_scores.dropna(subset=['Total Project Score Num']), x='Total Project Score Num', title='Total Project Score Distribution', nbins=10, text_auto=True)
+                fig_total.update_layout(bargap=0.1); st.plotly_chart(fig_total, use_container_width=True)
+            else: st.info("Total Project Score data not available for distribution chart.")
+            st.write(f"Top Project (Total Score): **{kpis.get('top_project_by_total_score', 'N/A')}**")
+            st.write(f"Bottom Project (Total Score): **{kpis.get('bottom_project_by_total_score', 'N/A')}**")
+            st.write("Total Score Bands (%):"); st.json(kpis.get('total_project_score_bands_pct', {}))
+            
+    with tab4:
+        st.subheader("Sponsor Check-in Status")
+        st.metric("Recent Meaningful Check-ins (last 30 days)", f"{format_number(kpis.get('recent_meaningful_checkins_count'))} ({format_percentage(kpis.get('recent_meaningful_checkins_pct'))})")
+        st.metric("Projects Overdue for Sponsor Check-in", kpis.get('overdue_sponsor_checkin_count'))
+        overdue_list = kpis.get('overdue_checkin_projects_list', [])
+        if overdue_list: st.write("Projects Overdue for Check-in:"); st.table(pd.DataFrame(overdue_list))
+        else: st.success("👍 All active projects have recent sponsor check-ins logged (or data unavailable).")
+
+def render_pipeline_page():
+    st.title("📈 Pipeline Deep Dive")
+    kpis = st.session_state.indicators
+    pipeline_df_original = st.session_state.all_data.get('Pipeline', pd.DataFrame())
+
+    st.markdown("<div class='section-header'>Pipeline Health Overview</div>", unsafe_allow_html=True)
+    cols = st.columns(4)
+    with cols[0]: st.metric("Active Pipeline Value", format_currency(kpis.get('active_pipeline_value')))
+    with cols[1]: st.metric("Total Potential Value", format_currency(kpis.get('total_potential_pipeline_value'))) 
+    with cols[2]: st.metric("Pipeline Coverage Ratio", f"{format_number(kpis.get('pipeline_coverage_ratio'),1)}x")
+    with cols[3]: st.metric("Avg. Pipeline Score", format_number(kpis.get('avg_pipeline_score'),1), f"Median: {format_number(kpis.get('median_pipeline_score'),1)}")
+
+    tab1, tab2, tab3 = st.tabs(["📋 All Opportunities", "🏆 Score Analysis", "⏱️ Deal Cycle Analysis"])
+
+    with tab1:
+        st.subheader("All Pipeline Opportunities")
+        if not pipeline_df_original.empty and 'Account' in pipeline_df_original.columns: # Identifier for pipeline
+            display_df = pipeline_df_original.copy()
+            if 'Open Pipeline_Active Work' in display_df.columns: display_df['Open Pipeline_Active Work'] = indicators.safe_to_numeric(display_df['Open Pipeline_Active Work']).apply(lambda x: f"${x:,.0f}")
+            if 'Percieved Annual AMO' in display_df.columns: display_df['Percieved Annual AMO'] = indicators.safe_to_numeric(display_df['Percieved Annual AMO']).apply(lambda x: f"${x:,.0f}")
+            if 'Pipeline Score' in display_df.columns: display_df['Pipeline Score'] = indicators.safe_to_numeric(display_df['Pipeline Score']).round(1)
+            display_cols = ['Account', 'Open Pipeline_Active Work', 'Percieved Annual AMO', 'Pipeline Score', 'Pursuit Tier', 'Horizon', 'Opportunity Created Date', 'Closed Won Date']
+            final_cols = [col for col in display_cols if col in display_df.columns]
+            st.dataframe(display_df[final_cols], use_container_width=True, height=400) # Reduced height
+            
+            st.markdown("---")
+            st.subheader("Edit Opportunity Details")
+            pipeline_account_names_for_edit = [""] + sorted(pipeline_df_original['Account'].astype(str).unique().tolist())
+            selected_pipeline_account_for_action = st.selectbox(
+                "Select an Account/Opportunity to edit:", pipeline_account_names_for_edit, index=0, key="pipeline_action_selector"
+            )
+            if selected_pipeline_account_for_action:
+                if st.button(f"✏️ Edit '{selected_pipeline_account_for_action}'", key=f"edit_pipe_{selected_pipeline_account_for_action.replace(' ','_')}"): # Unique key for button
+                    st.session_state.selected_pipeline_to_edit = selected_pipeline_account_for_action
+                    st.session_state.manage_data_entity_type = "Pipeline Opportunity" # Set type for Manage Data page
+                    st.session_state.current_page = "📝 Manage Data"
+                    st.experimental_rerun()
+        else: st.info("No pipeline data or 'Account' column available.")
+            
+    with tab2:
+        st.subheader("Pipeline Score Analysis")
+        pipeline_df_for_scores = pipeline_df_original.copy()
+        col_score1, col_score2 = st.columns(2)
+        with col_score1:
+            if 'Pipeline Score' in pipeline_df_for_scores.columns and not pipeline_df_for_scores['Pipeline Score'].dropna().empty:
+                pipeline_df_for_scores['Pipeline Score Num'] = indicators.safe_to_numeric(pipeline_df_for_scores['Pipeline Score'])
+                fig_health = px.histogram(pipeline_df_for_scores.dropna(subset=['Pipeline Score Num']), x='Pipeline Score Num', title='Pipeline Score Distribution', nbins=10, text_auto=True)
+                fig_health.update_layout(bargap=0.1); st.plotly_chart(fig_health, use_container_width=True)
+            else: st.info("Pipeline Score data not available for distribution.")
+            st.write(f"Top Opportunity (Pipeline Score): **{kpis.get('top_pipeline_by_score', 'N/A')}**"); st.write(f"Bottom Opportunity (Pipeline Score): **{kpis.get('bottom_pipeline_by_score', 'N/A')}**")
+            st.write("Pipeline Score Bands (%):"); st.json(kpis.get('pipeline_score_bands_pct', {}))
+        with col_score2:
+            if 'Total Deal Score' in pipeline_df_for_scores.columns and not pipeline_df_for_scores['Total Deal Score'].dropna().empty:
+                pipeline_df_for_scores['Total Deal Score Num'] = indicators.safe_to_numeric(pipeline_df_for_scores['Total Deal Score'])
+                fig_total = px.histogram(pipeline_df_for_scores.dropna(subset=['Total Deal Score Num']), x='Total Deal Score Num', title='Total Deal Score Distribution', nbins=10, text_auto=True)
+                fig_total.update_layout(bargap=0.1); st.plotly_chart(fig_total, use_container_width=True)
+            else: st.info("Total Deal Score data not available for distribution.")
+            st.write(f"Top Opportunity (Total Score): **{kpis.get('top_pipeline_by_total_score', 'N/A')}**"); st.write(f"Bottom Opportunity (Total Score): **{kpis.get('bottom_pipeline_by_total_score', 'N/A')}**")
+            st.write("Total Deal Score Bands (%):"); st.json(kpis.get('total_deal_score_bands_pct', {}))
+            
+    with tab3:
+        st.subheader("Deal Cycle Analysis")
+        st.metric("Avg. Deal Cycle Time", f"{format_number(kpis.get('avg_deal_cycle_time_days'))} days")
+        st.metric("Median Deal Cycle Time", f"{format_number(kpis.get('median_deal_cycle_time_days'))} days")
+        cycle_by_tier = kpis.get('deal_cycle_time_by_tier', {})
+        if cycle_by_tier:
+            st.write("Deal Cycle Time by Pursuit Tier:")
+            tier_data = [{"Pursuit Tier": tier, "Avg Days": format_number(times.get('mean',0)), "Median Days": format_number(times.get('median',0))} for tier, times in cycle_by_tier.items()]
+            st.table(pd.DataFrame(tier_data))
+        st.metric("Avg. Next Deal Gap (after project end)", f"{format_number(kpis.get('avg_next_deal_gap_days'))} days")
+        overdue_next_deal_count = kpis.get('overdue_next_deal_discussion_count', 0)
+        st.metric("Projects Overdue for Next Deal Discussion", overdue_next_deal_count)
+        if overdue_next_deal_count > 0: st.write("Projects Overdue:"); st.table(pd.DataFrame(kpis.get('overdue_next_deal_projects_list', [])))
+
+def render_risks_page():
+    st.title("⚠️ Risks Deep Dive")
+    kpis = st.session_state.indicators
+    risk_df_original = st.session_state.all_data.get('Project Risks', pd.DataFrame())
+    st.markdown("<div class='section-header'>Risk Overview</div>", unsafe_allow_html=True)
+    cols = st.columns(3)
+    with cols[0]: st.metric("Total Risk Impact", format_currency(kpis.get('total_risk_impact')))
+    with cols[1]: st.metric("High Severity Risk Items", format_number(kpis.get('high_severity_risk_count')))
+    with cols[2]: st.metric("High Severity Risk Impact", format_currency(kpis.get('high_severity_risk_impact')), delta=f"{format_percentage(kpis.get('high_risk_impact_as_pct_of_total'))} of total impact")
+    if not risk_df_original.empty:
+        if 'Impact ($)' in risk_df_original.columns and 'Severity' in risk_df_original.columns:
+            risk_df_cleaned = risk_df_original.copy()
+            risk_df_cleaned['Impact ($)'] = indicators.safe_to_numeric(risk_df_cleaned['Impact ($)'])
+            risk_df_cleaned['Severity'] = risk_df_cleaned['Severity'].astype(str).fillna('Unknown').str.capitalize()
+            severity_impact = risk_df_cleaned.groupby('Severity')['Impact ($)'].sum().reset_index()
+            fig_sev_val = px.pie(severity_impact, names='Severity', values='Impact ($)', title='Risk Impact by Severity', hole=0.3, color_discrete_map={'High': '#F56565', 'Medium': '#ECC94B', 'Low': '#48BB78', 'Unknown': '#A0AEC0'})
+            st.plotly_chart(fig_sev_val, use_container_width=True)
+        else: st.info("Required columns ('Impact ($)' or 'Severity') not found for risk distribution chart.")
+        st.subheader("Full Risk Register"); st.dataframe(risk_df_original, use_container_width=True, height=600)
+    else: st.info("No risk data available.")
+
+def render_team_ops_page():
+    st.title("👥 Team & Operations")
+    kpis = st.session_state.indicators
+    tab_util, tab_gaps, tab_exec = st.tabs(["📊 Team Utilization & Pulse", "🛠️ Talent & Operational Gaps", "💼 Executive Activity"])
+    with tab_util:
+        st.markdown("<div class='section-header'>Team Utilization</div>", unsafe_allow_html=True)
+        cols_util = st.columns(2)
+        with cols_util[0]: st.metric("Avg. Executive Utilization", format_percentage(kpis.get('avg_exec_utilization_pct')), f"{kpis.get('over_utilized_execs_count')} execs >70%")
+        with cols_util[1]: st.metric("Avg. Delivery Utilization", format_percentage(kpis.get('avg_delivery_utilization_pct')), f"{kpis.get('under_utilized_delivery_count')} under (<70%), {kpis.get('over_utilized_delivery_count')} over (>100%)")
+        util_df_original = st.session_state.all_data.get('Team Utilization', pd.DataFrame())
+        if not util_df_original.empty and 'Employee Name' in util_df_original.columns and 'Utilization (%)' in util_df_original.columns and 'Role' in util_df_original.columns:
+            util_df_c = util_df_original.copy()
+            util_df_c['Utilization (%)'] = indicators.safe_to_numeric(util_df_c['Utilization (%)'])
+            fig_util = px.bar(util_df_c.sort_values('Utilization (%)', ascending=False), x='Employee Name', y='Utilization (%)', color='Role', title='Team Member Utilization', text_auto=True)
+            fig_util.update_layout(xaxis_tickangle=-45, height=500); st.plotly_chart(fig_util, use_container_width=True)
+        else: st.info("Team utilization data or required columns not available for chart.")
+        st.markdown("<div class='section-header'>Employee Pulse</div>", unsafe_allow_html=True)
+        st.metric("Average Employee Pulse Score", format_number(kpis.get('avg_employee_pulse_score'),1), f"{format_percentage(kpis.get('employee_pulse_vs_target_pct'))} of target")
+    with tab_gaps:
+        st.markdown("<div class='section-header'>Talent Gaps</div>", unsafe_allow_html=True)
+        talent_gaps_df = st.session_state.all_data.get('Talent Gaps', pd.DataFrame())
+        if not talent_gaps_df.empty: st.dataframe(talent_gaps_df, use_container_width=True)
+        else: st.info("No talent gap data available.")
+        st.markdown("<div class='section-header'>Operational Gaps</div>", unsafe_allow_html=True)
+        operational_gaps_df = st.session_state.all_data.get('Operational Gaps', pd.DataFrame())
+        if not operational_gaps_df.empty: st.dataframe(operational_gaps_df, use_container_width=True)
+        else: st.info("No operational gap data available.")
+    with tab_exec:
+        st.markdown("<div class='section-header'>Executive Activity & Strategic Cost</div>", unsafe_allow_html=True)
+        st.metric("Total Strategic Cost (from Exec Activity)", format_currency(kpis.get('total_strategic_cost')))
+        st.metric("Total Strategic Activities Logged", format_number(kpis.get('total_strategic_activities_count')))
+        exec_activity_df_original = st.session_state.all_data.get('Executive Activity', pd.DataFrame())
+        if not exec_activity_df_original.empty: st.dataframe(exec_activity_df_original, use_container_width=True)
+        else: st.info("No executive activity data available.")
+
+def render_scenario_modeling_page():
+    st.title("⚙️ Scenario Modeling")
+    scenario_tabs_map = {"Inputs": 'Scenario Model Inputs', "Do Nothing": 'Do Nothing Scenario', "Proposed": 'Proposed Scenario', "Comparison": 'Scenario Comparison'}
+    selected_tab_name = st.selectbox("Select Scenario View", list(scenario_tabs_map.keys()))
+    df_name = scenario_tabs_map[selected_tab_name]
+    df = st.session_state.all_data.get(df_name, pd.DataFrame())
+    st.subheader(f"{selected_tab_name} Data")
+    if not df.empty: st.dataframe(df, use_container_width=True)
+    else: st.info(f"No data available for '{df_name}'.")
+
+def render_data_explorer_page():
+    st.title("🔍 Data Explorer")
+    worksheet_names = list(st.session_state.all_data.keys())
+    if not worksheet_names: st.warning("No data loaded yet. Please wait or try refreshing."); return
+    selected_view = st.selectbox("Select Worksheet to View", worksheet_names)
+    if selected_view in st.session_state.all_data:
+        df = st.session_state.all_data[selected_view]
+        if not df.empty:
+            st.subheader(f"Raw Data: {selected_view}")
+            if selected_view == 'Project Inventory' and 'Status (R/Y/G)' in df.columns:
+                def color_status(val):
+                    color = ''; s_val = str(val).upper()
+                    if pd.isna(val): return color
+                    if s_val == 'R': color = 'background-color: #ffcdd2' 
+                    elif s_val == 'Y': color = 'background-color: #fff9c4' 
+                    elif s_val == 'G': color = 'background-color: #c8e6c9' 
+                    return color
+                try: st.dataframe(df.style.applymap(color_status, subset=['Status (R/Y/G)']), use_container_width=True)
+                except Exception as e: st.warning(f"Could not apply color styling for Status: {e}"); st.dataframe(df, use_container_width=True)
+            else: st.dataframe(df, use_container_width=True)
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(label=f"Download {selected_view} as CSV", data=csv, file_name=f'{selected_view.lower().replace(" ", "_")}.csv', mime='text/csv')
+        else: st.info(f"Worksheet '{selected_view}' is empty or failed to load.")
+
+# --- Page for Data Management ---
+def render_manage_data_page():
+    st.title("📝 Manage Data")
+
+    entity_type_options = ["Project", "Pipeline Opportunity"]
+    # Determine default index for radio based on session state, ensure it's valid
+    try:
+        entity_type_index = entity_type_options.index(st.session_state.manage_data_entity_type)
+    except ValueError:
+        entity_type_index = 0 # Default to "Project" if current state is invalid
+        st.session_state.manage_data_entity_type = "Project"
+
+
+    entity_type = st.radio(
+        "What do you want to manage?",
+        entity_type_options,
+        index=entity_type_index, 
+        horizontal=True,
+        key="entity_type_selector_main" # Unique key
+    )
+    st.session_state.manage_data_entity_type = entity_type 
+
+    st.markdown("---")
+
+    if entity_type == "Project":
+        render_manage_project_form()
+    elif entity_type == "Pipeline Opportunity":
+        render_manage_pipeline_form()
+
+def render_manage_project_form():
+    st.subheader("Update Project Details")
+    project_df = st.session_state.all_data.get('Project Inventory', pd.DataFrame())
+
+    if project_df.empty or 'Project Name' not in project_df.columns:
+        st.warning("Project Inventory data or 'Project Name' column not loaded. Cannot manage project data.")
+        st.session_state.selected_project_to_edit = None 
+        return
+
+    project_names_list = [""] + sorted(project_df['Project Name'].astype(str).unique().tolist())
+    
+    default_project_index = 0
+    if st.session_state.selected_project_to_edit and st.session_state.selected_project_to_edit in project_names_list:
+        default_project_index = project_names_list.index(st.session_state.selected_project_to_edit)
+
+    selected_project_name = st.selectbox(
+        "Select Project to Update", 
+        project_names_list, 
+        index=default_project_index,
+        key="project_update_selector_on_manage_page_projectform" 
+    )
+    
+    if st.session_state.selected_project_to_edit: 
+         st.session_state.selected_project_to_edit = None
+
+    if selected_project_name:
+        project_data_series = project_df[project_df['Project Name'] == selected_project_name]
+        if project_data_series.empty:
+            st.error(f"Project '{selected_project_name}' not found. Please refresh data.")
+            return
+        project_data = project_data_series.iloc[0]
+        
+        try:
+            current_status_val = str(project_data.get('Status (R/Y/G)', 'G')).upper()
+            status_options = ['R', 'Y', 'G']
+            default_status_index = status_options.index(current_status_val) if current_status_val in status_options else status_options.index('G')
+        except ValueError: default_status_index = 2 
+
+        default_key_issues = str(project_data.get('Key Issues', ''))
+        default_next_steps = str(project_data.get('Next Steps', ''))
+        
+        default_checkin_date = None
+        raw_checkin_date = project_data.get('Last Sponsor Checkin Date')
+        if pd.notna(raw_checkin_date):
+            if isinstance(raw_checkin_date, (datetime, date)):
+                default_checkin_date = raw_checkin_date if isinstance(raw_checkin_date, date) else raw_checkin_date.date()
+            else: 
+                try: default_checkin_date = pd.to_datetime(raw_checkin_date, errors='raise').date()
+                except (ValueError, TypeError): st.warning(f"Could not parse existing check-in date '{raw_checkin_date}' for {selected_project_name}. Please re-enter.")
+        
+        default_checkin_notes = str(project_data.get('Sponsor Checkin Notes', ''))
+
+        with st.form(key=f"update_project_form_{selected_project_name.replace(' ','_')}"):
+            st.write(f"#### Updating Project: {selected_project_name}")
+            new_status = st.selectbox("Status (R/Y/G)", ['R', 'Y', 'G'], index=default_status_index)
+            new_key_issues = st.text_area("Key Issues", value=default_key_issues, height=100)
+            new_next_steps = st.text_area("Next Steps", value=default_next_steps, height=100)
+            new_checkin_date = st.date_input("Last Sponsor Check-in Date", value=default_checkin_date)
+            new_checkin_notes = st.text_area("Sponsor Check-in Notes", value=default_checkin_notes, height=150)
+            
+            submitted = st.form_submit_button("💾 Update Project in Google Sheet")
+
+            if submitted:
+                with st.spinner(f"Updating {selected_project_name}..."):
+                    update_payload = {
+                        "Status (R/Y/G)": new_status, "Key Issues": new_key_issues, "Next Steps": new_next_steps,
+                        "Last Sponsor Checkin Date": new_checkin_date.strftime('%Y-%m-%d') if new_checkin_date else "",
+                        "Sponsor Checkin Notes": new_checkin_notes
+                    }
+                    success = update_gsheet_row('Project Inventory', 'Project Name', selected_project_name, update_payload)
+                    if success:
+                        st.success(f"Project '{selected_project_name}' updated successfully!")
+                        st.session_state.data_loaded = False; st.cache_data.clear(); st.cache_resource.clear()
+                        st.session_state.initial_load_complete = False
+                        st.experimental_rerun()
+    else: st.info("Select a project to update its details.")
+
+def render_manage_pipeline_form():
+    st.subheader("Update Pipeline Opportunity Details")
+    pipeline_df = st.session_state.all_data.get('Pipeline', pd.DataFrame())
+
+    if pipeline_df.empty or 'Account' not in pipeline_df.columns:
+        st.warning("Pipeline data or 'Account' column not loaded. Cannot manage pipeline data.")
+        st.session_state.selected_pipeline_to_edit = None
+        return
+
+    pipeline_account_names_list = [""] + sorted(pipeline_df['Account'].astype(str).unique().tolist())
+    
+    default_pipeline_index = 0
+    if st.session_state.selected_pipeline_to_edit and st.session_state.selected_pipeline_to_edit in pipeline_account_names_list:
+        default_pipeline_index = pipeline_account_names_list.index(st.session_state.selected_pipeline_to_edit)
+
+    selected_account_name = st.selectbox(
+        "Select Pipeline Opportunity (by Account) to Update",
+        pipeline_account_names_list, index=default_pipeline_index, key="pipeline_update_selector_on_manage_page"
+    )
+
+    if st.session_state.selected_pipeline_to_edit: 
+        st.session_state.selected_pipeline_to_edit = None
+
+    if selected_account_name:
+        opportunity_data_series = pipeline_df[pipeline_df['Account'] == selected_account_name]
+        if opportunity_data_series.empty:
+            st.error(f"Opportunity for Account '{selected_account_name}' not found. Please refresh data.")
+            return
+        opportunity_data = opportunity_data_series.iloc[0] 
+        
+        # --- Pre-fill form fields for Pipeline (ADD MORE AS NEEDED) ---
+        def get_options_and_index(df, col_name, current_val_str):
+            options = [""] # Start with a blank option
+            if col_name in df.columns:
+                options.extend(sorted(df[col_name].astype(str).unique().tolist()))
+            
+            default_idx = 0
+            if current_val_str in options:
+                default_idx = options.index(current_val_str)
+            return options, default_idx
+
+        horizon_options, default_horizon_idx = get_options_and_index(pipeline_df, 'Horizon', str(opportunity_data.get('Horizon', '')))
+        pursuit_tier_options, default_pursuit_tier_idx = get_options_and_index(pipeline_df, 'Pursuit Tier', str(opportunity_data.get('Pursuit Tier', '')))
+        
+        default_notes = str(opportunity_data.get('Notes', ''))
+        default_help_needed = str(opportunity_data.get('Help Needed', ''))
+        default_actions = str(opportunity_data.get('Actions', ''))
+
+        yn_options = ["", "Y", "N"] 
+        default_deal_reg_val = str(opportunity_data.get('Deal Registered YN', '')).upper()
+        default_deal_reg_idx = yn_options.index(default_deal_reg_val) if default_deal_reg_val in yn_options else 0
+        
+        # Example: Percieved Annual AMO (numeric)
+        default_percieved_amo = 0.0
+        if 'Percieved Annual AMO' in opportunity_data and pd.notna(opportunity_data['Percieved Annual AMO']):
+            try:
+                default_percieved_amo = float(str(opportunity_data['Percieved Annual AMO']).replace('$','').replace(',',''))
+            except ValueError:
+                default_percieved_amo = 0.0
+
+
+        with st.form(key=f"update_pipeline_form_{selected_account_name.replace(' ','_')}"):
+            st.write(f"#### Updating Pipeline Opportunity: {selected_account_name}")
+            
+            cols1, cols2 = st.columns(2)
+            with cols1:
+                new_horizon = st.selectbox("Horizon", horizon_options, index=default_horizon_idx)
+                new_deal_reg = st.selectbox("Deal Registered (Y/N)", yn_options, index=default_deal_reg_idx)
+            with cols2:
+                new_pursuit_tier = st.selectbox("Pursuit Tier", pursuit_tier_options, index=default_pursuit_tier_idx)
+                new_percieved_amo = st.number_input("Percieved Annual AMO", value=default_percieved_amo, step=1000.0, format="%d")
+
+
+            new_notes = st.text_area("Notes", value=default_notes, height=100)
+            new_help_needed = st.text_area("Help Needed", value=default_help_needed, height=75)
+            new_actions = st.text_area("Actions", value=default_actions, height=75)
+            
+            submitted = st.form_submit_button("💾 Update Pipeline Opportunity in Google Sheet")
+
+            if submitted:
+                with st.spinner(f"Updating {selected_account_name}..."):
+                    update_payload = {
+                        "Horizon": new_horizon, "Pursuit Tier": new_pursuit_tier, "Notes": new_notes,
+                        "Help Needed": new_help_needed, "Actions": new_actions, "Deal Registered YN": new_deal_reg,
+                        "Percieved Annual AMO": int(new_percieved_amo) # Ensure it's a number for GSheet if it expects one
+                    }
+                    update_payload_cleaned = {k: v for k, v in update_payload.items() if isinstance(v, (int, float)) or (isinstance(v, str) and v != "")}
+
+
+                    success = update_gsheet_row('Pipeline', 'Account', selected_account_name, update_payload_cleaned)
+                    if success:
+                        st.success(f"Pipeline opportunity for '{selected_account_name}' updated successfully!")
+                        st.session_state.data_loaded = False; st.cache_data.clear(); st.cache_resource.clear()
+                        st.session_state.initial_load_complete = False
+                        st.experimental_rerun()
+    else: st.info("Select a pipeline opportunity (by Account) to update its details.")
+
+# --- Main Application ---
+PAGES = {
+    "🏠 Home": render_home_dashboard,
+    "📊 Projects": render_projects_page,
+    "📈 Pipeline": render_pipeline_page,
+    "⚠️ Risks": render_risks_page,
+    "👥 Team & Ops": render_team_ops_page,
+    "📝 Manage Data": render_manage_data_page, 
+    "⚙️ Scenario Modeling": render_scenario_modeling_page,
+    "🔍 Data Explorer": render_data_explorer_page,
+}
 
 def main():
-    # Initialize session state
-    if 'data' not in st.session_state:
-        st.session_state.data = {}
-    if 'metrics' not in st.session_state:
-        st.session_state.metrics = {}
-    # Initialize Google Sheets connection
-    sheet = setup_google_sheets()
-    if not sheet:
-        st.error("Failed to connect to Google Sheets. Please check your credentials.")
-        return
-    # Load data for all worksheets
-    worksheet_names = [
-        'Project Inventory', 'Project Risks', 'Pipeline', 'Team Utilization',
-        'Talent Gaps', 'Operational Gaps', 'Executive Activity',
-        'Scenario Model Inputs', 'Do Nothing Scenario', 'Proposed Scenario',
-        'Scenario Comparison'
-    ]
-    if not st.session_state.data or all(df.empty for df in st.session_state.data.values()):
-        for name in worksheet_names:
-            st.session_state.data[name] = load_sheet_data(sheet, name)
-        if any(not df.empty for df in st.session_state.data.values()):
-            st.session_state.metrics = calculate_dashboard_metrics(st.session_state.data)
+    init_session_state()
     
-    # --- NAVIGATION BAR ---
-    nav_cols = st.columns([8, 1, 1, 1, 1])
-    with nav_cols[1]:
-        if st.button("🏠 Home"):
-            st.session_state.current_page = "homepage"
-    with nav_cols[2]:
-        if st.button("📊 Data Views"):
-            st.session_state.current_page = "data_views"
-    with nav_cols[3]:
-        if st.button("📈 Analytics"):
-            st.session_state.current_page = "analytics"
-    with nav_cols[4]:
-        if st.button("📋 Metrics"):
-            st.session_state.current_page = "metrics"
+    st.sidebar.image("https://assets-global.website-files.com/635273ea37c256ef28f52930/635273ea37c256f4f5f52a71_Logo%20Purple.png", width=200)
+    st.sidebar.title("Healthcare Delivery OS")
+    st.sidebar.markdown("---")
     
-    # Default to homepage
-    if 'current_page' not in st.session_state:
-        st.session_state.current_page = "homepage"
+    st.sidebar.subheader("Navigation")
     
-    # --- PAGE RENDERING ---
-    if st.session_state.current_page == "homepage":
-        openai_api_key = os.getenv('OPENAI_API_KEY')
-        openai_client = None
-        if openai_api_key:
-            import openai
-            openai_client = openai.OpenAI(api_key=openai_api_key)
-        render_homepage(st.session_state.data, openai_client)
-    elif st.session_state.current_page == "data_views":
-        st.title("Data Views")
-        selected_view = st.selectbox(
-            "Select View",
-            worksheet_names
-        )
-        if selected_view in st.session_state.data:
-            df = st.session_state.data[selected_view]
-            if selected_view == 'Project Inventory' and 'Status (R/Y/G)' in df.columns:
-                # Convert Revenue to numeric for sorting, then format as currency for display
-                df = df.copy()
-                if 'Revenue' in df.columns:
-                    df['Revenue'] = df['Revenue'].astype(str).str.replace('$', '').str.replace(',', '').str.strip()
-                    df['Revenue'] = pd.to_numeric(df['Revenue'], errors='coerce').fillna(0)
-                    df['Revenue'] = df['Revenue'].map(lambda x: f"${x:,.2f}")
-                def color_status(val):
-                    colors = {
-                        'Red': 'background-color: #ffcdd2',
-                        'Yellow': 'background-color: #fff9c4',
-                        'Green': 'background-color: #c8e6c9'
-                    }
-                    return colors.get(val, '')
-                styled_df = df.style.map(color_status, subset=['Status (R/Y/G)'])
-                st.dataframe(styled_df, use_container_width=True)
-            else:
-                st.dataframe(df, use_container_width=True)
-    elif st.session_state.current_page == "analytics":
-        st.title("Analytics")
-        visualizations = create_analytics_visualizations(st.session_state.data)
-        for i in range(0, len(visualizations), 2):
-            cols = st.columns(2)
-            for j in range(2):
-                if i + j < len(visualizations):
-                    title, content = visualizations[i + j]
-                    with cols[j]:
-                        st.subheader(title)
-                        if isinstance(content, dict):
-                            for metric_name, metric_value in content.items():
-                                st.metric(metric_name, metric_value)
-                        else:
-                            st.plotly_chart(content, use_container_width=True)
-    elif st.session_state.current_page == "metrics":
-        st.title("Detailed Metrics")
-        render_dashboard()
+    current_page_key_index = list(PAGES.keys()).index(st.session_state.current_page) if st.session_state.current_page in PAGES else 0
     
-    # Render AI Assistant in sidebar
-    render_ai_assistant(st.session_state.data)
+    st.session_state.current_page = st.sidebar.radio(
+        "Go to", list(PAGES.keys()), index=current_page_key_index, key="navigation_radio" 
+    )
+    st.sidebar.markdown("---")
+
+    if not st.session_state.data_loaded :
+        load_all_data() 
+    
+    if st.sidebar.button("🔄 Refresh Data"):
+        st.session_state.data_loaded = False 
+        st.cache_data.clear() 
+        st.cache_resource.clear() 
+        st.session_state.initial_load_complete = False 
+        load_all_data() 
+        st.experimental_rerun()
+
+    render_ai_assistant()
+    
+    if st.session_state.data_loaded and st.session_state.indicators:
+        page_function = PAGES.get(st.session_state.current_page) 
+        if page_function: page_function()
+        else: st.error("Selected page not found. Defaulting to Home."); render_home_dashboard() 
+    elif not st.session_state.data_loaded: st.warning("Data is loading or connection failed. Please wait or check console for errors.")
+    else: st.warning("Indicators are not yet calculated. Please wait or refresh data.")
 
 if __name__ == "__main__":
-    main() 
+    main()

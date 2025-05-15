@@ -57,7 +57,7 @@ Below is the schema definition for each tab in the google sheet.
 
 | Column                      | Description                                                                 |
 |-----------------------------|-----------------------------------------------------------------------------|
-| Account Name                | Name of the customer or account in the sales pipeline.                      |
+| Account                | Name of the customer or account in the sales pipeline.                      |
 | Opportunity Created Date    | Date when the opportunity was first logged (YYYY-MM-DD).                     |
 | Closed Won Date             | Date when the deal was successfully closed (YYYY-MM-DD).                    |
 | Support Focus Type          | Primary type of support required (Tier 1/2/3).              |

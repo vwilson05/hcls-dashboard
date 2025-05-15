@@ -1,330 +1,517 @@
 import pandas as pd
 from datetime import datetime, timedelta
+import re
 from strategic_targets import (
-    REVENUE_TARGET, REVENUE_STRETCH_GOAL, FY27_TARGET, FY27_BOOKED_IN_FY26_TARGET,
+    REVENUE_TARGET, REVENUE_STRETCH_GOAL,
     GREEN_PROJECT_TARGET, EMPLOYEE_PULSE_TARGET, PIPELINE_COVERAGE_TARGET,
     SPONSOR_CHECKIN_WINDOW_DAYS, NEXT_DEAL_DISCUSSION_THRESHOLD_DAYS, CUSTOMER_NPS_TARGET,
-    PROJECT_SCORE_BANDS, PIPELINE_SCORE_BANDS, PROJECT_HEALTH_SCORE_TARGET, PIPELINE_SCORE_TARGET
+    PROJECT_SCORE_BANDS, PIPELINE_SCORE_BANDS
 )
 
-# --- Score Banding Helpers ---
+# --- Helper Functions ---
+def safe_to_numeric(series, Ttype=float, remove_chars=r'[$,%()A-Za-z]'):
+    if series is None:
+        return pd.Series(dtype=Ttype)
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    
+    if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_object_dtype(series):
+        return series.astype(Ttype)
+
+    cleaned_series = series.astype(str).str.replace(remove_chars, '', regex=True).str.strip()
+    cleaned_series = cleaned_series.replace('', '0') 
+    return pd.to_numeric(cleaned_series, errors='coerce').fillna(0).astype(Ttype)
+
+
 def band_score(score, bands):
+    if pd.isna(score):
+        return 'N/A'
     for band, (low, high) in bands.items():
         if low <= score <= high:
             return band
-    return None
+    return 'N/A' 
+
 
 def score_band_distribution(scores, bands):
     band_counts = {band: 0 for band in bands}
+    band_counts['N/A'] = 0 
+    valid_scores = 0
     for s in scores:
         band = band_score(s, bands)
-        if band:
+        if band in band_counts:
             band_counts[band] += 1
-    total = sum(band_counts.values())
-    band_pct = {band: (count / total * 100 if total > 0 else 0) for band, count in band_counts.items()}
+        if band != 'N/A':
+            valid_scores +=1
+            
+    total_valid = valid_scores
+    band_pct = {band: (count / total_valid * 100 if total_valid > 0 else 0) for band, count in band_counts.items() if band != 'N/A'}
     return band_counts, band_pct
 
-def get_lagging_indicators(data):
-    """Extract lagging indicators from the data dict."""
-    indicators = {}
-    
-    # Revenue
+# --- Main Indicator Functions ---
+
+def get_general_and_project_kpis(data):
+    kpis = {}
     project_df = data.get('Project Inventory')
+    
+    project_name_col = 'Project Name' 
+
     if project_df is not None and not project_df.empty:
         project_df = project_df.copy()
-        project_df['Revenue'] = project_df['Revenue'].astype(str).str.replace('$', '').str.replace(',', '')
-        project_df['Revenue'] = pd.to_numeric(project_df['Revenue'], errors='coerce').fillna(0)
+        
+        # Ensure critical columns exist or handle gracefully
+        if 'Revenue' in project_df.columns:
+            project_df['Revenue'] = safe_to_numeric(project_df['Revenue'])
+        else:
+            project_df['Revenue'] = 0 # Default if column missing
+            print("Warning: 'Revenue' column missing in Project Inventory.")
+
+        if 'Status (R/Y/G)' in project_df.columns:
+            project_df['Status (R/Y/G)'] = project_df['Status (R/Y/G)'].astype(str).str.strip().str.upper()
+        else:
+            project_df['Status (R/Y/G)'] = 'UNKNOWN' # Default if column missing
+            print("Warning: 'Status (R/Y/G)' column missing in Project Inventory.")
+
+        kpis['total_projects'] = len(project_df)
+        
+        red_projects = project_df[project_df['Status (R/Y/G)'] == 'R']
+        kpis['red_projects_count'] = len(red_projects)
+        kpis['red_project_revenue'] = red_projects['Revenue'].sum()
+        
+        yellow_projects = project_df[project_df['Status (R/Y/G)'] == 'Y']
+        kpis['yellow_projects_count'] = len(yellow_projects)
+        
+        green_projects = project_df[project_df['Status (R/Y/G)'] == 'G']
+        kpis['green_projects_count'] = len(green_projects)
+        
         total_revenue = project_df['Revenue'].sum()
-        indicators['Revenue'] = total_revenue
-        indicators['Revenue_vs_Target'] = (total_revenue / REVENUE_TARGET) * 100
-        indicators['Revenue_vs_Stretch'] = (total_revenue / REVENUE_STRETCH_GOAL) * 100
-    else:
-        indicators['Revenue'] = None
-        indicators['Revenue_vs_Target'] = None
-        indicators['Revenue_vs_Stretch'] = None
+        kpis['total_revenue'] = total_revenue
+        kpis['revenue_vs_target_pct'] = (total_revenue / REVENUE_TARGET * 100) if REVENUE_TARGET else 0
+        kpis['revenue_vs_stretch_pct'] = (total_revenue / REVENUE_STRETCH_GOAL * 100) if REVENUE_STRETCH_GOAL else 0
+        
+        has_project_name_col = project_name_col in project_df.columns
 
-    # Customer NPS (eNPS)
-    if project_df is not None and not project_df.empty and 'eNPS' in project_df.columns:
-        try:
-            enps = pd.to_numeric(project_df['eNPS'], errors='coerce').dropna()
-            avg_enps = enps.mean() if not enps.empty else None
-            indicators['Customer NPS'] = avg_enps
-            indicators['Customer NPS_vs_Target'] = (avg_enps / CUSTOMER_NPS_TARGET) * 100 if avg_enps is not None else None
-        except Exception:
-            indicators['Customer NPS'] = None
-            indicators['Customer NPS_vs_Target'] = None
-    else:
-        indicators['Customer NPS'] = None
-        indicators['Customer NPS_vs_Target'] = None
+        if 'Project Health Score' in project_df.columns:
+            scores = safe_to_numeric(project_df['Project Health Score']).dropna()
+            kpis['avg_project_health_score'] = scores.mean() if not scores.empty else 0
+            kpis['median_project_health_score'] = scores.median() if not scores.empty else 0
+            _, band_pct = score_band_distribution(scores, PROJECT_SCORE_BANDS)
+            kpis['project_health_score_bands_pct'] = band_pct
+            if not scores.empty and has_project_name_col:
+                kpis['top_project_by_health_score'] = project_df.loc[scores.idxmax(), project_name_col]
+                kpis['bottom_project_by_health_score'] = project_df.loc[scores.idxmin(), project_name_col]
+            else:
+                kpis['top_project_by_health_score'] = "N/A"
+                kpis['bottom_project_by_health_score'] = "N/A"
+                if not has_project_name_col and not scores.empty:
+                    print(f"Warning: Column '{project_name_col}' not found in Project Inventory for top/bottom health score.")
+        else:
+            kpis.update({'avg_project_health_score': 0, 'median_project_health_score': 0, 'project_health_score_bands_pct': {}, 'top_project_by_health_score': "N/A", 'bottom_project_by_health_score': "N/A"})
+            print("Warning: 'Project Health Score' column missing in Project Inventory.")
+            
+        if 'Total Project Score' in project_df.columns:
+            total_scores = safe_to_numeric(project_df['Total Project Score']).dropna()
+            kpis['avg_total_project_score'] = total_scores.mean() if not total_scores.empty else 0
+            kpis['median_total_project_score'] = total_scores.median() if not total_scores.empty else 0
+            _, band_pct_total = score_band_distribution(total_scores, PROJECT_SCORE_BANDS)
+            kpis['total_project_score_bands_pct'] = band_pct_total
+            if not total_scores.empty and has_project_name_col:
+                kpis['top_project_by_total_score'] = project_df.loc[total_scores.idxmax(), project_name_col]
+                kpis['bottom_project_by_total_score'] = project_df.loc[total_scores.idxmin(), project_name_col]
+            else:
+                kpis['top_project_by_total_score'] = "N/A"
+                kpis['bottom_project_by_total_score'] = "N/A"
+                if not has_project_name_col and not total_scores.empty:
+                     print(f"Warning: Column '{project_name_col}' not found in Project Inventory for top/bottom total score.")
+        else:
+            kpis.update({'avg_total_project_score': 0, 'median_total_project_score': 0, 'total_project_score_bands_pct': {}, 'top_project_by_total_score': "N/A", 'bottom_project_by_total_score': "N/A"})
+            print("Warning: 'Total Project Score' column missing in Project Inventory.")
+    else: # project_df is None or empty
+        kpis.update({
+            'total_projects': 0, 'red_projects_count': 0, 'red_project_revenue': 0,
+            'yellow_projects_count': 0, 'green_projects_count': 0, 'total_revenue': 0,
+            'revenue_vs_target_pct': 0, 'revenue_vs_stretch_pct': 0,
+            'avg_project_health_score': 0, 'median_project_health_score': 0,
+            'project_health_score_bands_pct': {}, 'top_project_by_health_score': "N/A", 'bottom_project_by_health_score': "N/A",
+            'avg_total_project_score': 0, 'median_total_project_score': 0,
+            'total_project_score_bands_pct': {}, 'top_project_by_total_score': "N/A", 'bottom_project_by_total_score': "N/A"
+        })
+    return kpis
 
-    # Employee Satisfaction (Pulse Score)
-    util_df = data.get('Team Utilization')
-    if util_df is not None and not util_df.empty and 'Latest Pulse Score' in util_df.columns:
-        try:
-            pulse = pd.to_numeric(util_df['Latest Pulse Score'], errors='coerce').dropna()
-            avg_pulse = pulse.mean() if not pulse.empty else None
-            indicators['Employee Satisfaction'] = avg_pulse
-            indicators['Employee Satisfaction_vs_Target'] = (avg_pulse / EMPLOYEE_PULSE_TARGET) * 100 if avg_pulse is not None else None
-        except Exception:
-            indicators['Employee Satisfaction'] = None
-            indicators['Employee Satisfaction_vs_Target'] = None
-    else:
-        indicators['Employee Satisfaction'] = None
-        indicators['Employee Satisfaction_vs_Target'] = None
-
-    # Project Health Score Metrics
-    if project_df is not None and not project_df.empty and 'Project Health Score' in project_df.columns:
-        try:
-            scores = pd.to_numeric(project_df['Project Health Score'], errors='coerce').dropna()
-            indicators['Avg Project Health Score'] = scores.mean() if not scores.empty else None
-            indicators['Median Project Health Score'] = scores.median() if not scores.empty else None
-            band_counts, band_pct = score_band_distribution(scores, PROJECT_SCORE_BANDS)
-            indicators['Project Health Score Bands'] = band_counts
-            indicators['Project Health Score Bands %'] = band_pct
-            # Top/Bottom
-            if not scores.empty:
-                top_idx = scores.idxmax()
-                bot_idx = scores.idxmin()
-                indicators['Top Project by Health Score'] = project_df.loc[top_idx, 'Project Name']
-                indicators['Bottom Project by Health Score'] = project_df.loc[bot_idx, 'Project Name']
-            # Total Project Score
-            if 'Delivery Efficiency Score' in project_df.columns:
-                efficiency_scores = pd.to_numeric(project_df['Delivery Efficiency Score'], errors='coerce').dropna()
-                total_project_scores = scores * 0.7 + efficiency_scores * 0.3
-                indicators['Avg Total Project Score'] = total_project_scores.mean() if not total_project_scores.empty else None
-                indicators['Median Total Project Score'] = total_project_scores.median() if not total_project_scores.empty else None
-                band_counts, band_pct = score_band_distribution(total_project_scores, PROJECT_SCORE_BANDS)
-                indicators['Total Project Score Bands'] = band_counts
-                indicators['Total Project Score Bands %'] = band_pct
-                # Top/Bottom
-                if not total_project_scores.empty:
-                    top_idx = total_project_scores.idxmax()
-                    bot_idx = total_project_scores.idxmin()
-                    indicators['Top Project by Total Score'] = project_df.loc[top_idx, 'Project Name']
-                    indicators['Bottom Project by Total Score'] = project_df.loc[bot_idx, 'Project Name']
-        except Exception:
-            indicators['Avg Project Health Score'] = None
-            indicators['Median Project Health Score'] = None
-            indicators['Project Health Score Bands'] = None
-            indicators['Project Health Score Bands %'] = None
-            indicators['Top Project by Health Score'] = None
-            indicators['Bottom Project by Health Score'] = None
-            indicators['Avg Total Project Score'] = None
-            indicators['Median Total Project Score'] = None
-            indicators['Total Project Score Bands'] = None
-            indicators['Total Project Score Bands %'] = None
-            indicators['Top Project by Total Score'] = None
-            indicators['Bottom Project by Total Score'] = None
-    else:
-        indicators['Avg Project Health Score'] = None
-        indicators['Median Project Health Score'] = None
-        indicators['Project Health Score Bands'] = None
-        indicators['Project Health Score Bands %'] = None
-        indicators['Top Project by Health Score'] = None
-        indicators['Bottom Project by Health Score'] = None
-        indicators['Avg Total Project Score'] = None
-        indicators['Median Total Project Score'] = None
-        indicators['Total Project Score Bands'] = None
-        indicators['Total Project Score Bands %'] = None
-        indicators['Top Project by Total Score'] = None
-        indicators['Bottom Project by Total Score'] = None
-
-    return indicators
-
-def get_leading_indicators(data):
-    """Extract leading indicators from the data dict."""
-    indicators = {}
-    
-    # Pipeline Coverage
+def get_pipeline_and_risk_kpis(data):
+    kpis = {}
     pipeline_df = data.get('Pipeline')
+    risk_df = data.get('Project Risks')
+
+    pipeline_account_col = 'Account' # Adjusted to 'Account'
+
     if pipeline_df is not None and not pipeline_df.empty:
         pipeline_df = pipeline_df.copy()
-        pipeline_df['Open Pipeline_Active Work'] = pipeline_df['Open Pipeline_Active Work'].astype(str).str.replace('$', '').str.replace(',', '')
-        pipeline_df['Open Pipeline_Active Work'] = pd.to_numeric(pipeline_df['Open Pipeline_Active Work'], errors='coerce').fillna(0)
-        total_pipeline = pipeline_df['Open Pipeline_Active Work'].sum()
-        pipeline_coverage = total_pipeline / REVENUE_TARGET
-        indicators['Pipeline Coverage'] = total_pipeline
-        indicators['Pipeline Coverage Ratio'] = pipeline_coverage
-        indicators['Pipeline Coverage_vs_Target'] = (pipeline_coverage / PIPELINE_COVERAGE_TARGET) * 100
-    else:
-        indicators['Pipeline Coverage'] = None
-        indicators['Pipeline Coverage Ratio'] = None
-        indicators['Pipeline Coverage_vs_Target'] = None
 
-    # Deal Cycle Time
-    if pipeline_df is not None and not pipeline_df.empty:
-        try:
-            pipeline_df['Opportunity Created Date'] = pd.to_datetime(pipeline_df['Opportunity Created Date'], errors='coerce')
-            pipeline_df['Closed Won Date'] = pd.to_datetime(pipeline_df['Closed Won Date'], errors='coerce')
-            won_deals = pipeline_df.dropna(subset=['Closed Won Date'])
-            won_deals['Cycle Time'] = (won_deals['Closed Won Date'] - won_deals['Opportunity Created Date']).dt.days
-            indicators['Avg Deal Cycle Time'] = won_deals['Cycle Time'].mean()
-            indicators['Median Deal Cycle Time'] = won_deals['Cycle Time'].median()
-            
-            # Group by Pursuit Tier if available
-            if 'Pursuit Tier' in won_deals.columns:
-                tier_cycle_times = won_deals.groupby('Pursuit Tier')['Cycle Time'].agg(['mean', 'median']).to_dict()
-                indicators['Deal Cycle Time by Tier'] = tier_cycle_times
-        except Exception:
-            indicators['Avg Deal Cycle Time'] = None
-            indicators['Median Deal Cycle Time'] = None
-            indicators['Deal Cycle Time by Tier'] = None
+        if 'Open Pipeline_Active Work' in pipeline_df.columns:
+            pipeline_df['Open Pipeline_Active Work'] = safe_to_numeric(pipeline_df['Open Pipeline_Active Work'])
+        else:
+            pipeline_df['Open Pipeline_Active Work'] = 0
+            print("Warning: 'Open Pipeline_Active Work' column missing in Pipeline.")
+        
+        if 'Percieved Annual AMO' in pipeline_df.columns:
+            pipeline_df['Percieved Annual AMO'] = safe_to_numeric(pipeline_df['Percieved Annual AMO'])
+        else:
+            pipeline_df['Percieved Annual AMO'] = 0
+            print("Warning: 'Percieved Annual AMO' column missing in Pipeline.")
+
+
+        kpis['active_pipeline_value'] = pipeline_df['Open Pipeline_Active Work'].sum()
+        kpis['total_potential_pipeline_value'] = pipeline_df['Percieved Annual AMO'].sum()
+        
+        kpis['pipeline_coverage_ratio'] = (kpis['active_pipeline_value'] / REVENUE_TARGET) if REVENUE_TARGET else 0
+        kpis['pipeline_coverage_vs_target_pct'] = (kpis['pipeline_coverage_ratio'] / PIPELINE_COVERAGE_TARGET * 100) if PIPELINE_COVERAGE_TARGET else 0
+        
+        has_pipeline_account_col = pipeline_account_col in pipeline_df.columns
+
+        if 'Pipeline Score' in pipeline_df.columns:
+            scores = safe_to_numeric(pipeline_df['Pipeline Score']).dropna()
+            kpis['avg_pipeline_score'] = scores.mean() if not scores.empty else 0
+            kpis['median_pipeline_score'] = scores.median() if not scores.empty else 0
+            _, band_pct = score_band_distribution(scores, PIPELINE_SCORE_BANDS)
+            kpis['pipeline_score_bands_pct'] = band_pct
+            if not scores.empty and has_pipeline_account_col:
+                 kpis['top_pipeline_by_score'] = pipeline_df.loc[scores.idxmax(), pipeline_account_col]
+                 kpis['bottom_pipeline_by_score'] = pipeline_df.loc[scores.idxmin(), pipeline_account_col]
+            else:
+                 kpis['top_pipeline_by_score'] = "N/A"
+                 kpis['bottom_pipeline_by_score'] = "N/A"
+                 if not has_pipeline_account_col and not scores.empty:
+                     print(f"Warning: Column '{pipeline_account_col}' not found in Pipeline data for top/bottom score calculation.")
+        else:
+            kpis.update({'avg_pipeline_score': 0, 'median_pipeline_score': 0, 'pipeline_score_bands_pct': {}, 'top_pipeline_by_score': "N/A", 'bottom_pipeline_by_score': "N/A"})
+            print("Warning: 'Pipeline Score' column missing in Pipeline.")
+
+        if 'Total Deal Score' in pipeline_df.columns:
+            total_scores = safe_to_numeric(pipeline_df['Total Deal Score']).dropna()
+            kpis['avg_total_deal_score'] = total_scores.mean() if not total_scores.empty else 0
+            kpis['median_total_deal_score'] = total_scores.median() if not total_scores.empty else 0
+            _, band_pct_total = score_band_distribution(total_scores, PIPELINE_SCORE_BANDS)
+            kpis['total_deal_score_bands_pct'] = band_pct_total
+            if not total_scores.empty and has_pipeline_account_col:
+                 kpis['top_pipeline_by_total_score'] = pipeline_df.loc[total_scores.idxmax(), pipeline_account_col]
+                 kpis['bottom_pipeline_by_total_score'] = pipeline_df.loc[total_scores.idxmin(), pipeline_account_col]
+            else:
+                 kpis['top_pipeline_by_total_score'] = "N/A"
+                 kpis['bottom_pipeline_by_total_score'] = "N/A"
+                 if not has_pipeline_account_col and not total_scores.empty: 
+                     print(f"Warning: Column '{pipeline_account_col}' not found in Pipeline data for top/bottom total score calculation.")
+        else:
+            kpis.update({'avg_total_deal_score': 0, 'median_total_deal_score': 0, 'total_deal_score_bands_pct': {}, 'top_pipeline_by_total_score': "N/A", 'bottom_pipeline_by_total_score': "N/A"})
+            print("Warning: 'Total Deal Score' column missing in Pipeline.")
+    else: # pipeline_df is None or empty
+        kpis.update({
+            'active_pipeline_value': 0, 'total_potential_pipeline_value': 0,
+            'pipeline_coverage_ratio': 0, 'pipeline_coverage_vs_target_pct': 0,
+            'avg_pipeline_score': 0, 'median_pipeline_score': 0, 'pipeline_score_bands_pct': {},
+            'top_pipeline_by_score': "N/A", 'bottom_pipeline_by_score': "N/A",
+            'avg_total_deal_score': 0, 'median_total_deal_score': 0, 'total_deal_score_bands_pct': {},
+            'top_pipeline_by_total_score': "N/A", 'bottom_pipeline_by_total_score': "N/A"
+        })
+
+    # Risk Metrics
+    if risk_df is not None and not risk_df.empty:
+        risk_df = risk_df.copy()
+        if 'Impact ($)' in risk_df.columns:
+            risk_df['Impact ($)'] = safe_to_numeric(risk_df['Impact ($)'])
+        else:
+            risk_df['Impact ($)'] = 0
+            print("Warning: 'Impact ($)' column missing in Project Risks.")
+        
+        if 'Severity' in risk_df.columns:
+            risk_df['Severity'] = risk_df['Severity'].astype(str).fillna('').str.lower()
+        else:
+            risk_df['Severity'] = 'unknown'
+            print("Warning: 'Severity' column missing in Project Risks.")
+
+
+        high_risks = risk_df[risk_df['Severity'] == 'high']
+        kpis['high_severity_risk_count'] = len(high_risks)
+        kpis['high_severity_risk_impact'] = high_risks['Impact ($)'].sum()
+        kpis['total_risk_impact'] = risk_df['Impact ($)'].sum()
+        kpis['high_risk_impact_as_pct_of_total'] = (kpis['high_severity_risk_impact'] / kpis['total_risk_impact'] * 100) if kpis['total_risk_impact'] else 0
+    else: # risk_df is None or empty
+        kpis.update({
+            'high_severity_risk_count': 0, 'high_severity_risk_impact': 0,
+            'total_risk_impact': 0, 'high_risk_impact_as_pct_of_total': 0
+        })
+    return kpis
+
+def get_satisfaction_and_efficiency_kpis(data):
+    kpis = {}
+    project_df = data.get('Project Inventory')
+    pipeline_df = data.get('Pipeline')
+    util_df = data.get('Team Utilization')
+    exec_activity_df = data.get('Executive Activity')
+    
+    project_name_col = 'Project Name'
+
+    # Customer NPS (eNPS from Project Inventory)
+    if project_df is not None and not project_df.empty and 'eNPS' in project_df.columns:
+        enps_scores = safe_to_numeric(project_df['eNPS']).dropna()
+        kpis['avg_customer_nps'] = enps_scores.mean() if not enps_scores.empty else 0
+        kpis['customer_nps_vs_target_pct'] = (kpis['avg_customer_nps'] / CUSTOMER_NPS_TARGET * 100) if CUSTOMER_NPS_TARGET and kpis['avg_customer_nps'] is not None and kpis['avg_customer_nps'] != 0 else 0
     else:
-        indicators['Avg Deal Cycle Time'] = None
-        indicators['Median Deal Cycle Time'] = None
-        indicators['Deal Cycle Time by Tier'] = None
+        kpis['avg_customer_nps'] = 0
+        kpis['customer_nps_vs_target_pct'] = 0
+        if project_df is None or project_df.empty: print("Info: Project Inventory data not available for eNPS.")
+        elif 'eNPS' not in project_df.columns: print("Warning: 'eNPS' column missing in Project Inventory for eNPS.")
+
+    # Employee Satisfaction (Pulse Score from Team Utilization)
+    if util_df is not None and not util_df.empty and 'Latest Pulse Score' in util_df.columns:
+        pulse_scores = safe_to_numeric(util_df['Latest Pulse Score']).dropna()
+        kpis['avg_employee_pulse_score'] = pulse_scores.mean() if not pulse_scores.empty else 0
+        kpis['employee_pulse_vs_target_pct'] = (kpis['avg_employee_pulse_score'] / EMPLOYEE_PULSE_TARGET * 100) if EMPLOYEE_PULSE_TARGET and kpis['avg_employee_pulse_score'] is not None and kpis['avg_employee_pulse_score'] != 0 else 0
+    else:
+        kpis['avg_employee_pulse_score'] = 0
+        kpis['employee_pulse_vs_target_pct'] = 0
+        if util_df is None or util_df.empty: print("Info: Team Utilization data not available for Pulse Score.")
+        elif 'Latest Pulse Score' not in util_df.columns: print("Warning: 'Latest Pulse Score' column missing in Team Utilization.")
+        
+    # Deal Cycle Time
+    if pipeline_df is not None and not pipeline_df.empty and 'Opportunity Created Date' in pipeline_df.columns and 'Closed Won Date' in pipeline_df.columns:
+        pipeline_df_copy = pipeline_df.copy()
+        pipeline_df_copy['Opportunity Created Date'] = pd.to_datetime(pipeline_df_copy['Opportunity Created Date'], errors='coerce')
+        pipeline_df_copy['Closed Won Date'] = pd.to_datetime(pipeline_df_copy['Closed Won Date'], errors='coerce')
+        won_deals = pipeline_df_copy.dropna(subset=['Opportunity Created Date', 'Closed Won Date'])
+        if not won_deals.empty:
+            won_deals['Cycle Time'] = (won_deals['Closed Won Date'] - won_deals['Opportunity Created Date']).dt.days
+            cycle_times = won_deals['Cycle Time'][won_deals['Cycle Time'] >= 0] 
+            kpis['avg_deal_cycle_time_days'] = cycle_times.mean() if not cycle_times.empty else 0
+            kpis['median_deal_cycle_time_days'] = cycle_times.median() if not cycle_times.empty else 0
+            if 'Pursuit Tier' in won_deals.columns:
+                kpis['deal_cycle_time_by_tier'] = won_deals.groupby('Pursuit Tier')['Cycle Time'].agg(['mean', 'median']).to_dict('index')
+            else:
+                kpis['deal_cycle_time_by_tier'] = {}
+        else: # No won deals with both dates
+            kpis['avg_deal_cycle_time_days'] = 0
+            kpis['median_deal_cycle_time_days'] = 0
+            kpis['deal_cycle_time_by_tier'] = {}
+    else: # Pipeline df or required date columns missing
+        kpis['avg_deal_cycle_time_days'] = 0
+        kpis['median_deal_cycle_time_days'] = 0
+        kpis['deal_cycle_time_by_tier'] = {}
+        if pipeline_df is None or pipeline_df.empty: print("Info: Pipeline data not available for Deal Cycle Time.")
+        else:
+            if 'Opportunity Created Date' not in pipeline_df.columns: print("Warning: 'Opportunity Created Date' missing in Pipeline.")
+            if 'Closed Won Date' not in pipeline_df.columns: print("Warning: 'Closed Won Date' missing in Pipeline.")
 
     # Time Between Project End and Next Deal Discussion
-    project_df = data.get('Project Inventory')
-    if project_df is not None and not project_df.empty:
-        try:
-            project_df['Project End Date'] = pd.to_datetime(project_df['Project End Date'], errors='coerce')
-            project_df['Next Opp First Discussion Date'] = pd.to_datetime(project_df['Next Opp First Discussion Date'], errors='coerce')
-            completed_projects = project_df.dropna(subset=['Project End Date'])
-            completed_projects['Next Deal Gap'] = (completed_projects['Next Opp First Discussion Date'] - completed_projects['Project End Date']).dt.days
-            indicators['Avg Next Deal Gap'] = completed_projects['Next Deal Gap'].mean()
-            
-            # Flag projects overdue for next deal discussion
-            overdue_projects = completed_projects[
-                (completed_projects['Next Deal Gap'] > NEXT_DEAL_DISCUSSION_THRESHOLD_DAYS) |
-                (completed_projects['Next Opp First Discussion Date'].isna())
+    required_cols_next_deal = [project_name_col, 'Project End Date', 'Next Opp First Discussion Date']
+    if project_df is not None and not project_df.empty and all(col in project_df.columns for col in required_cols_next_deal):
+        project_df_copy = project_df.copy()
+
+        project_df_copy['Project End Date'] = pd.to_datetime(project_df_copy['Project End Date'], errors='coerce')
+        project_df_copy['Next Opp First Discussion Date'] = pd.to_datetime(project_df_copy['Next Opp First Discussion Date'], errors='coerce')
+        
+        completed_projects_with_next_opp = project_df_copy.dropna(subset=['Project End Date', 'Next Opp First Discussion Date'])
+        if not completed_projects_with_next_opp.empty:
+            valid_end_dates_mask = completed_projects_with_next_opp['Project End Date'].notna()
+            if valid_end_dates_mask.any():
+                df_calc = completed_projects_with_next_opp[valid_end_dates_mask].copy() # Use .copy() to avoid SettingWithCopyWarning
+                df_calc['Next Deal Gap'] = (df_calc['Next Opp First Discussion Date'] - df_calc['Project End Date']).dt.days
+                next_deal_gaps = df_calc['Next Deal Gap'][df_calc['Next Deal Gap'] >=0]
+                kpis['avg_next_deal_gap_days'] = next_deal_gaps.mean() if not next_deal_gaps.empty else 0
+            else:
+                kpis['avg_next_deal_gap_days'] = 0
+        else:
+            kpis['avg_next_deal_gap_days'] = 0
+        
+        ended_projects = project_df_copy[project_df_copy['Project End Date'].notna()] 
+        if not ended_projects.empty:
+            current_date_naive = pd.to_datetime('today').normalize() 
+
+            overdue_next_deal_df = ended_projects[
+                ((current_date_naive - ended_projects['Project End Date']).dt.days > NEXT_DEAL_DISCUSSION_THRESHOLD_DAYS) & 
+                ended_projects['Next Opp First Discussion Date'].isna() & 
+                (ended_projects['Project End Date'] < current_date_naive) 
             ]
-            indicators['Overdue Next Deal Projects'] = overdue_projects[['Project Name', 'Project End Date', 'Next Opp First Discussion Date', 'Next Deal Gap']].to_dict('records')
-        except Exception:
-            indicators['Avg Next Deal Gap'] = None
-            indicators['Overdue Next Deal Projects'] = None
-    else:
-        indicators['Avg Next Deal Gap'] = None
-        indicators['Overdue Next Deal Projects'] = None
+            kpis['overdue_next_deal_discussion_count'] = len(overdue_next_deal_df)
+            # Ensure 'Project Name' column exists for the list
+            if project_name_col in overdue_next_deal_df.columns:
+                 kpis['overdue_next_deal_projects_list'] = overdue_next_deal_df[[project_name_col, 'Project End Date']].to_dict('records')
+            else:
+                 kpis['overdue_next_deal_projects_list'] = overdue_next_deal_df[['Project End Date']].to_dict('records') # Fallback if 'Project Name' is missing
+                 print(f"Warning: '{project_name_col}' column missing for overdue_next_deal_projects_list.")
+        else:
+            kpis['overdue_next_deal_discussion_count'] = 0
+            kpis['overdue_next_deal_projects_list'] = []
+    else: 
+        kpis['avg_next_deal_gap_days'] = 0
+        kpis['overdue_next_deal_discussion_count'] = 0
+        kpis['overdue_next_deal_projects_list'] = []
+        if project_df is None or project_df.empty: print("Info: Project Inventory data not available for Next Deal Gap.")
+        else: 
+            for col in required_cols_next_deal:
+                if col not in project_df.columns: print(f"Warning: Column '{col}' missing in Project Inventory for Next Deal Gap.")
+
 
     # Meaningful Sponsor Check-ins
-    if project_df is not None and not project_df.empty:
-        try:
-            project_df['Last Sponsor Checkin Date'] = pd.to_datetime(project_df['Last Sponsor Checkin Date'], errors='coerce')
-            current_date = pd.Timestamp.now()
-            recent_checkins = project_df[
-                (project_df['Last Sponsor Checkin Date'] >= current_date - pd.Timedelta(days=SPONSOR_CHECKIN_WINDOW_DAYS)) &
-                (project_df['Sponsor Checkin Notes'].notna() & (project_df['Sponsor Checkin Notes'].str.strip() != ''))
+    required_cols_checkin = [project_name_col, 'Last Sponsor Checkin Date', 'Sponsor Checkin Notes', 'Project End Date']
+    if project_df is not None and not project_df.empty and all(col in project_df.columns for col in required_cols_checkin):
+        project_df_copy = project_df.copy()
+        project_df_copy['Last Sponsor Checkin Date'] = pd.to_datetime(project_df_copy['Last Sponsor Checkin Date'], errors='coerce')
+        project_df_copy['Project End Date'] = pd.to_datetime(project_df_copy['Project End Date'], errors='coerce')
+        current_date_naive = pd.to_datetime('today').normalize()
+        
+        active_projects_df = project_df_copy[
+            project_df_copy['Project End Date'].isna() | 
+            (project_df_copy['Project End Date'] >= current_date_naive)
+        ].copy() # Use .copy() here
+        total_active_projects = len(active_projects_df)
+
+        if total_active_projects > 0:
+            active_projects_df['Sponsor Checkin Notes'] = active_projects_df['Sponsor Checkin Notes'].astype(str) # Ensure string for strip
+            recent_checkins_df = active_projects_df[
+                (active_projects_df['Last Sponsor Checkin Date'].notna()) &
+                (active_projects_df['Last Sponsor Checkin Date'] >= current_date_naive - pd.Timedelta(days=SPONSOR_CHECKIN_WINDOW_DAYS)) &
+                (active_projects_df['Sponsor Checkin Notes'].str.strip() != '')
             ]
-            total_projects = len(project_df)
-            indicators['Recent Meaningful Check-ins'] = len(recent_checkins)
-            indicators['Recent Meaningful Check-ins %'] = (len(recent_checkins) / total_projects * 100) if total_projects > 0 else 0
+            kpis['recent_meaningful_checkins_count'] = len(recent_checkins_df)
+            kpis['recent_meaningful_checkins_pct'] = (kpis['recent_meaningful_checkins_count'] / total_active_projects * 100)
             
-            # Flag projects overdue for check-in
-            overdue_checkins = project_df[
-                (project_df['Last Sponsor Checkin Date'] < current_date - pd.Timedelta(days=SPONSOR_CHECKIN_WINDOW_DAYS)) |
-                (project_df['Last Sponsor Checkin Date'].isna())
+            overdue_checkin_df = active_projects_df[
+                ((active_projects_df['Last Sponsor Checkin Date'].isna()) |
+                (active_projects_df['Last Sponsor Checkin Date'] < current_date_naive - pd.Timedelta(days=SPONSOR_CHECKIN_WINDOW_DAYS)))
             ]
-            indicators['Overdue Check-in Projects'] = overdue_checkins[['Project Name', 'Last Sponsor Checkin Date', 'Sponsor Checkin Notes']].to_dict('records')
-        except Exception:
-            indicators['Recent Meaningful Check-ins'] = None
-            indicators['Recent Meaningful Check-ins %'] = None
-            indicators['Overdue Check-in Projects'] = None
+            kpis['overdue_sponsor_checkin_count'] = len(overdue_checkin_df)
+            if project_name_col in overdue_checkin_df.columns:
+                kpis['overdue_checkin_projects_list'] = overdue_checkin_df[[project_name_col, 'Last Sponsor Checkin Date']].to_dict('records')
+            else:
+                kpis['overdue_checkin_projects_list'] = overdue_checkin_df[['Last Sponsor Checkin Date']].to_dict('records')
+                print(f"Warning: '{project_name_col}' column missing for overdue_checkin_projects_list.")
+
+        else: # No active projects
+            kpis['recent_meaningful_checkins_count'] = 0
+            kpis['recent_meaningful_checkins_pct'] = 0
+            kpis['overdue_sponsor_checkin_count'] = 0
+            kpis['overdue_checkin_projects_list'] = []
     else:
-        indicators['Recent Meaningful Check-ins'] = None
-        indicators['Recent Meaningful Check-ins %'] = None
-        indicators['Overdue Check-in Projects'] = None
+        kpis['recent_meaningful_checkins_count'] = 0
+        kpis['recent_meaningful_checkins_pct'] = 0
+        kpis['overdue_sponsor_checkin_count'] = 0
+        kpis['overdue_checkin_projects_list'] = []
+        if project_df is None or project_df.empty: print("Info: Project Inventory data not available for Sponsor Check-ins.")
+        else:
+            for col in required_cols_checkin:
+                if col not in project_df.columns: print(f"Warning: Column '{col}' missing in Project Inventory for Sponsor Check-ins.")
+
 
     # Green Project Ratio
-    if project_df is not None and not project_df.empty:
-        try:
-            green_projects = project_df[project_df['Status (R/Y/G)'].str.strip().str.upper() == 'G']
-            total_projects = len(project_df)
-            green_ratio = len(green_projects) / total_projects if total_projects > 0 else 0
-            indicators['Green Project Ratio'] = green_ratio
-            indicators['Green Project Ratio_vs_Target'] = (green_ratio / GREEN_PROJECT_TARGET) * 100
-            
-            # Flag non-green projects
-            non_green_projects = project_df[project_df['Status (R/Y/G)'].str.strip().str.upper() != 'G']
-            indicators['Non-Green Projects'] = non_green_projects[['Project Name', 'Status (R/Y/G)', 'Key Issues']].to_dict('records')
-        except Exception:
-            indicators['Green Project Ratio'] = None
-            indicators['Green Project Ratio_vs_Target'] = None
-            indicators['Non-Green Projects'] = None
+    required_cols_green_ratio = [project_name_col, 'Status (R/Y/G)', 'Key Issues']
+    if project_df is not None and not project_df.empty and 'Status (R/Y/G)' in project_df.columns: # Key Issues is optional for list
+        # Status (R/Y/G) already processed in get_general_and_project_kpis
+        total_projects = kpis.get('total_projects', 0) 
+        green_projects_count = kpis.get('green_projects_count', 0)
+        
+        kpis['green_project_ratio'] = (green_projects_count / total_projects) if total_projects > 0 else 0
+        kpis['green_project_ratio_vs_target_pct'] = (kpis['green_project_ratio'] / GREEN_PROJECT_TARGET * 100) if GREEN_PROJECT_TARGET else 0
+        
+        non_green_df = project_df[project_df['Status (R/Y/G)'].isin(['R', 'Y'])]
+        
+        list_cols = [project_name_col, 'Status (R/Y/G)']
+        if 'Key Issues' in non_green_df.columns:
+            list_cols.append('Key Issues')
+        elif 'Key Issues' not in project_df.columns : # Check original df
+            print("Info: 'Key Issues' column missing in Project Inventory for non-green projects list.")
+        
+        if project_name_col in non_green_df.columns:
+            kpis['non_green_projects_list'] = non_green_df[list_cols].to_dict('records')
+        else: # If project name is missing, this list is less useful but won't error
+            kpis['non_green_projects_list'] = non_green_df[[col for col in list_cols if col != project_name_col]].to_dict('records')
+            print(f"Warning: '{project_name_col}' column missing for non_green_projects_list.")
     else:
-        indicators['Green Project Ratio'] = None
-        indicators['Green Project Ratio_vs_Target'] = None
-        indicators['Non-Green Projects'] = None
+        kpis['green_project_ratio'] = 0
+        kpis['green_project_ratio_vs_target_pct'] = 0
+        kpis['non_green_projects_list'] = []
+        if project_df is None or project_df.empty: print("Info: Project Inventory data not available for Green Project Ratio.")
+        elif 'Status (R/Y/G)' not in project_df.columns: print("Warning: 'Status (R/Y/G)' column missing in Project Inventory.")
 
-    # Pipeline Score Metrics
-    if pipeline_df is not None and not pipeline_df.empty and 'Pipeline Score' in pipeline_df.columns:
-        try:
-            scores = pd.to_numeric(pipeline_df['Pipeline Score'], errors='coerce').dropna()
-            indicators['Avg Pipeline Score'] = scores.mean() if not scores.empty else None
-            indicators['Median Pipeline Score'] = scores.median() if not scores.empty else None
-            band_counts, band_pct = score_band_distribution(scores, PIPELINE_SCORE_BANDS)
-            indicators['Pipeline Score Bands'] = band_counts
-            indicators['Pipeline Score Bands %'] = band_pct
-            # Top/Bottom
-            if not scores.empty:
-                top_idx = scores.idxmax()
-                bot_idx = scores.idxmin()
-                indicators['Top Pipeline by Score'] = pipeline_df.loc[top_idx, 'Account']
-                indicators['Bottom Pipeline by Score'] = pipeline_df.loc[bot_idx, 'Account']
-            # Total Deal Score
-            if 'Relational Efficiency Score' in pipeline_df.columns:
-                relational_scores = pd.to_numeric(pipeline_df['Relational Efficiency Score'], errors='coerce').dropna()
-                total_deal_scores = scores * 0.7 + relational_scores * 0.3
-                indicators['Avg Total Deal Score'] = total_deal_scores.mean() if not total_deal_scores.empty else None
-                indicators['Median Total Deal Score'] = total_deal_scores.median() if not total_deal_scores.empty else None
-                band_counts, band_pct = score_band_distribution(total_deal_scores, PIPELINE_SCORE_BANDS)
-                indicators['Total Deal Score Bands'] = band_counts
-                indicators['Total Deal Score Bands %'] = band_pct
-                # Top/Bottom
-                if not total_deal_scores.empty:
-                    top_idx = total_deal_scores.idxmax()
-                    bot_idx = total_deal_scores.idxmin()
-                    indicators['Top Pipeline by Total Score'] = pipeline_df.loc[top_idx, 'Account']
-                    indicators['Bottom Pipeline by Total Score'] = pipeline_df.loc[bot_idx, 'Account']
-        except Exception:
-            indicators['Avg Pipeline Score'] = None
-            indicators['Median Pipeline Score'] = None
-            indicators['Pipeline Score Bands'] = None
-            indicators['Pipeline Score Bands %'] = None
-            indicators['Top Pipeline by Score'] = None
-            indicators['Bottom Pipeline by Score'] = None
-            indicators['Avg Total Deal Score'] = None
-            indicators['Median Total Deal Score'] = None
-            indicators['Total Deal Score Bands'] = None
-            indicators['Total Deal Score Bands %'] = None
-            indicators['Top Pipeline by Total Score'] = None
-            indicators['Bottom Pipeline by Total Score'] = None
+
+    # Team Utilization
+    required_cols_util = ['Role', 'Utilization (%)']
+    if util_df is not None and not util_df.empty and all(col in util_df.columns for col in required_cols_util):
+        util_df_copy = util_df.copy()
+        util_df_copy['Utilization (%)'] = safe_to_numeric(util_df_copy['Utilization (%)'])
+        
+        # Ensure 'Role' is string for .str.contains
+        util_df_copy['Role'] = util_df_copy['Role'].astype(str)
+        exec_df = util_df_copy[util_df_copy['Role'].str.contains('Executive', case=False, na=False)]
+        delivery_df = util_df_copy[~util_df_copy['Role'].str.contains('Executive', case=False, na=False)]
+        
+        kpis['avg_exec_utilization_pct'] = exec_df['Utilization (%)'].mean() if not exec_df.empty else 0
+        kpis['avg_delivery_utilization_pct'] = delivery_df['Utilization (%)'].mean() if not delivery_df.empty else 0
+        kpis['over_utilized_execs_count'] = len(exec_df[exec_df['Utilization (%)'] > 70]) if not exec_df.empty else 0 
+        kpis['under_utilized_delivery_count'] = len(delivery_df[delivery_df['Utilization (%)'] < 70]) if not delivery_df.empty else 0 
+        kpis['over_utilized_delivery_count'] = len(delivery_df[delivery_df['Utilization (%)'] > 100]) if not delivery_df.empty else 0 
     else:
-        indicators['Avg Pipeline Score'] = None
-        indicators['Median Pipeline Score'] = None
-        indicators['Pipeline Score Bands'] = None
-        indicators['Pipeline Score Bands %'] = None
-        indicators['Top Pipeline by Score'] = None
-        indicators['Bottom Pipeline by Score'] = None
-        indicators['Avg Total Deal Score'] = None
-        indicators['Median Total Deal Score'] = None
-        indicators['Total Deal Score Bands'] = None
-        indicators['Total Deal Score Bands %'] = None
-        indicators['Top Pipeline by Total Score'] = None
-        indicators['Bottom Pipeline by Total Score'] = None
+        kpis['avg_exec_utilization_pct'] = 0
+        kpis['avg_delivery_utilization_pct'] = 0
+        kpis['over_utilized_execs_count'] = 0
+        kpis['under_utilized_delivery_count'] = 0
+        kpis['over_utilized_delivery_count'] = 0
+        if util_df is None or util_df.empty: print("Info: Team Utilization data not available.")
+        else:
+            for col in required_cols_util:
+                if col not in util_df.columns: print(f"Warning: Column '{col}' missing in Team Utilization.")
+        
+    # Strategic Costs
+    if exec_activity_df is not None and not exec_activity_df.empty and 'Strategic Cost ($)' in exec_activity_df.columns:
+        exec_activity_df_copy = exec_activity_df.copy()
+        exec_activity_df_copy['Strategic Cost ($)'] = safe_to_numeric(exec_activity_df_copy['Strategic Cost ($)'])
+        kpis['total_strategic_cost'] = exec_activity_df_copy['Strategic Cost ($)'].sum()
+        kpis['total_strategic_activities_count'] = len(exec_activity_df_copy)
+    else:
+        kpis['total_strategic_cost'] = 0
+        kpis['total_strategic_activities_count'] = 0
+        if exec_activity_df is None or exec_activity_df.empty: print("Info: Executive Activity data not available.")
+        elif 'Strategic Cost ($)' not in exec_activity_df.columns : print("Warning: 'Strategic Cost ($)' column missing in Executive Activity.")
+        
+    return kpis
 
-    return indicators
 
-def get_top3_action_items(data, openai_client, data_context):
-    """Use OpenAI to generate top 3 actionable items for today."""
+def get_all_indicators(data):
+    all_kpis = {}
+    all_kpis.update(get_general_and_project_kpis(data))
+    all_kpis.update(get_pipeline_and_risk_kpis(data))
+    all_kpis.update(get_satisfaction_and_efficiency_kpis(data))
+    return all_kpis
+
+def get_top3_action_items(data, openai_client, data_context_string):
+    if not openai_client:
+        return "OpenAI client not configured. Cannot generate action items."
+        
+    max_context_len = 100000 
+    if len(data_context_string) > max_context_len:
+        data_context_string = data_context_string[:max_context_len] + "\n... (data truncated)"
+
     prompt = f"""
-You are a business operations assistant. Based on the following data, identify the top 3 most urgent or actionable items for today. Be specific, actionable, and reference the relevant person, project, or metric.
+You are a business operations assistant for a healthcare delivery organization. Based on the following data snapshot, identify the top 3 most urgent and actionable items for the leadership today. 
+Focus on risks, underperformance against targets, critical project issues, or urgent pipeline needs.
+Be specific: mention project names, people, or exact metrics that need attention. Frame each item as a clear action.
 
 Data:
-{data_context}
+{data_context_string}
 
-Return your answer as a numbered list.
+Return your answer as a markdown numbered list. Example:
+1. **Address Red Project 'X':** Key issue is Y, revenue at risk is $Z. Action: Schedule emergency meeting with PM.
+2. **Boost Pipeline Coverage:** Currently at A.Bc ratio, target is 3.0x. Action: Focus sales team on deals in TIER.
+3. **Support Underutilized Staff:** N team members below 70% utilization. Action: Review upcoming project needs with resource manager.
 """
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o", 
             messages=[
-                {"role": "system", "content": "You are a business operations assistant. Provide actionable, specific recommendations."},
+                {"role": "system", "content": "You are a highly experienced operations director for a professional services firm. Provide concise, actionable, and data-driven recommendations."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5,
-            max_tokens=300
+            temperature=0.3, 
+            max_tokens=400
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"Error generating action items: {str(e)}" 
+        return f"Error generating AI action items: {str(e)}"
