@@ -585,7 +585,7 @@ def render_projects_page():
                     st.session_state.selected_project_to_edit = selected_project_name_for_action
                     st.session_state.manage_data_entity_type = "Project" # Set type for Manage Data page
                     st.session_state.current_page = "📝 Manage Data"
-                    st.experimental_rerun()
+                    st.rerun()
         else: st.info("No project data or 'Project Name' column available.")
             
     with tab2:
@@ -675,7 +675,7 @@ def render_pipeline_page():
                     st.session_state.selected_pipeline_to_edit = selected_pipeline_account_for_action
                     st.session_state.manage_data_entity_type = "Pipeline Opportunity" # Set type for Manage Data page
                     st.session_state.current_page = "📝 Manage Data"
-                    st.experimental_rerun()
+                    st.rerun()
         else: st.info("No pipeline data or 'Account' column available.")
             
     with tab2:
@@ -906,7 +906,7 @@ def render_manage_project_form():
                         st.success(f"Project '{selected_project_name}' updated successfully!")
                         st.session_state.data_loaded = False; st.cache_data.clear(); st.cache_resource.clear()
                         st.session_state.initial_load_complete = False
-                        st.experimental_rerun()
+                        st.rerun()
     else: st.info("Select a project to update its details.")
 
 def render_manage_pipeline_form():
@@ -1003,7 +1003,7 @@ def render_manage_pipeline_form():
                         st.success(f"Pipeline opportunity for '{selected_account_name}' updated successfully!")
                         st.session_state.data_loaded = False; st.cache_data.clear(); st.cache_resource.clear()
                         st.session_state.initial_load_complete = False
-                        st.experimental_rerun()
+                        st.rerun()
     else: st.info("Select a pipeline opportunity (by Account) to update its details.")
 
 # --- Main Application ---
@@ -1043,7 +1043,7 @@ def main():
         st.cache_resource.clear() 
         st.session_state.initial_load_complete = False 
         load_all_data() 
-        st.experimental_rerun()
+        st.rerun()
 
     render_ai_assistant()
     
