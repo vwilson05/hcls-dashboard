@@ -96,6 +96,106 @@ st.markdown("""
             border-bottom: 2px solid #CBD5E0; 
             padding-bottom: 5px;
         }
+        
+        /* --- Mobile Responsiveness --- */
+        @media (max-width: 768px) { /* Applies to tablets and smaller phones */
+            .stTabs [data-baseweb="tab-list"] {
+                gap: 8px; /* Smaller gap between tabs */
+                /* Consider making tabs scrollable if too many for mobile: */
+                /* overflow-x: auto; white-space: nowrap; */
+            }
+            .stTabs [data-baseweb="tab"] { 
+                padding: 8px 10px; 
+                font-size: 0.9em; 
+            }
+
+            .metric-card {
+                padding: 12px; /* Smaller padding for metric cards */
+                margin-bottom: 8px;
+            }
+            .metric-card-title {
+                font-size: 0.85em; /* Adjusted for slightly better readability */
+                margin-bottom: 4px;
+            }
+            .metric-card-value {
+                font-size: 1.5em; /* Smaller font for metric values */
+            }
+            .metric-card-delta {
+                font-size: 0.75em;
+            }
+
+            .section-header {
+                font-size: 1.25em; /* Smaller section headers */
+                margin-top: 15px;
+                margin-bottom: 10px;
+            }
+
+            /* --- Streamlit Column Stacking --- */
+            /* This targets the container for columns. */
+            /* Streamlit's internal structure can change, so these selectors might need future adjustments. */
+            /* Use browser dev tools "Inspect" to verify selectors if stacking doesn't work. */
+            
+            /* General approach for blocks used by st.columns */
+            div[data-testid="stHorizontalBlock"] {
+                flex-direction: column !important; /* Stack the main column blocks */
+            }
+
+            /* Ensure that individual columns within the now-stacked block take full width */
+            div[data-testid="stHorizontalBlock"] > div[data-baseweb="block"] > div[data-testid="stVerticalBlock"],
+            div[data-testid="stHorizontalBlock"] > div.stButton > button, /* Target buttons directly in columns */
+            div[data-testid="stHorizontalBlock"] > div.stSelectbox { /* Target selectboxes directly in columns */
+                width: 100% !important;
+                margin-bottom: 10px; /* Add space between stacked items */
+            }
+            /* If columns are nested, you might need more specific selectors or a more general one: */
+            /*
+            .main > div > div > div > div[data-testid="stVerticalBlock"] {
+                 width: 100% !important;
+                 margin-bottom: 10px;
+            }
+            */
+
+
+            /* Adjust font size for general text if needed */
+            body, .stApp, div[data-testid="stMarkdownContainer"] p { /* Target paragraphs within markdown */
+                font-size: 15px; /* Slightly smaller base font on mobile */
+            }
+            .stDataFrame { /* Make dataframes take less vertical space by default on mobile */
+                /* Consider reducing height or showing fewer rows/columns by default on mobile */
+                /* max-height: 350px; */ /* Adjust as needed */
+            }
+            /* Make selectboxes and text inputs more touch-friendly / readable */
+            .stSelectbox > div, .stTextInput > div > div > input, .stTextArea > div > textarea, .stDateInput > div > div > input {
+                font-size: 0.95em !important; /* Slightly larger touch target / font */
+            }
+        }
+
+        @media (max-width: 480px) { /* Specific overrides for very small phone screens */
+            .metric-card-title {
+                font-size: 0.8em;
+            }
+            .metric-card-value {
+                font-size: 1.3em; 
+            }
+            .stButton > button { /* Ensure buttons are full width and have decent padding */
+                width: 100%;
+                padding: 0.6em 0.5em; /* Adjust padding for better touch area */
+                font-size: 0.95em; /* Ensure text is readable */
+            }
+             .stSelectbox div[data-baseweb="select"] { 
+                font-size: 0.95em; /* Ensure readability */
+             }
+             .stDateInput input { /* Ensure readability */
+                 font-size: 0.95em;
+             }
+             .stTextArea textarea { /* Ensure readability */
+                 font-size: 0.95em;
+             }
+             .stTabs [data-baseweb="tab"] { 
+                font-size: 0.85em; /* Even smaller tabs if needed */
+                padding: 6px 8px;
+            }
+        }
     </style>
 """, unsafe_allow_html=True)
 
