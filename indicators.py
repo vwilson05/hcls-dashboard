@@ -49,8 +49,9 @@ def score_band_distribution(scores, bands):
 
 # --- Main Indicator Functions ---
 
-def get_general_and_project_kpis(data):
-    kpis = {}
+def get_general_and_project_kpis(data, kpis=None):
+    if kpis is None:
+        kpis = {}
     project_df = data.get('Project Inventory')
     
     project_name_col = 'Project Name' 
@@ -137,8 +138,9 @@ def get_general_and_project_kpis(data):
         })
     return kpis
 
-def get_pipeline_and_risk_kpis(data):
-    kpis = {}
+def get_pipeline_and_risk_kpis(data, kpis=None):
+    if kpis is None:
+        kpis = {}
     pipeline_df = data.get('Pipeline')
     risk_df = data.get('Project Risks')
 
@@ -241,8 +243,9 @@ def get_pipeline_and_risk_kpis(data):
         })
     return kpis
 
-def get_satisfaction_and_efficiency_kpis(data):
-    kpis = {}
+def get_satisfaction_and_efficiency_kpis(data, kpis=None):
+    if kpis is None:
+        kpis = {}
     project_df = data.get('Project Inventory')
     pipeline_df = data.get('Pipeline')
     util_df = data.get('Team Utilization')
@@ -475,11 +478,11 @@ def get_satisfaction_and_efficiency_kpis(data):
 
 
 def get_all_indicators(data):
-    all_kpis = {}
-    all_kpis.update(get_general_and_project_kpis(data))
-    all_kpis.update(get_pipeline_and_risk_kpis(data))
-    all_kpis.update(get_satisfaction_and_efficiency_kpis(data))
-    return all_kpis
+    kpis = {}
+    kpis = get_general_and_project_kpis(data, kpis)
+    kpis = get_pipeline_and_risk_kpis(data, kpis)
+    kpis = get_satisfaction_and_efficiency_kpis(data, kpis)
+    return kpis
 
 def get_top3_action_items(data, openai_client, data_context_string):
     if not openai_client:
