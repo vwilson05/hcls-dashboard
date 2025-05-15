@@ -109,7 +109,7 @@ def init_session_state():
         st.session_state.indicators = {}
     if 'openai_client' not in st.session_state:
         try:
-            st.session_state.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            st.session_state.openai_client = openai.OpenAI(api_key=get_env_var('OPENAI_API_KEY'))
         except Exception as e:
             st.session_state.openai_client = None
     if 'current_page' not in st.session_state:
@@ -129,20 +129,32 @@ def init_session_state():
     if 'initial_load_complete' not in st.session_state:
         st.session_state.initial_load_complete = False
 
+# --- Secret/Env Helper Functions ---
+def get_env_var(key, default=None):
+    if hasattr(st, "secrets") and key in st.secrets:
+        return st.secrets[key]
+    return os.getenv(key, default)
+
+def get_google_credentials_file():
+    if hasattr(st, "secrets") and "google_service_account" in st.secrets:
+        import tempfile, json
+        creds_dict = dict(st.secrets["google_service_account"])
+        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.json') as f:
+            json.dump(creds_dict, f)
+            return f.name
+    return os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "credentials.json")
 
 # --- Data Loading and Processing ---
 @st.cache_resource(ttl=300) 
 def setup_google_sheets_cached():
-    credentials_file = os.getenv('GOOGLE_SHEETS_CREDENTIALS_FILE')
-    sheet_name = os.getenv('GOOGLE_SHEET_NAME')
-
+    credentials_file = get_google_credentials_file()
+    sheet_name = get_env_var('GOOGLE_SHEET_NAME')
     if not credentials_file or not os.path.exists(credentials_file):
         st.error(f"Credentials file not found: {credentials_file}")
         return None
     if not sheet_name:
-        st.error("GOOGLE_SHEET_NAME not configured in .env file")
+        st.error("GOOGLE_SHEET_NAME not configured in .env or secrets")
         return None
-
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     credentials = Credentials.from_service_account_file(credentials_file, scopes=scopes)
     
