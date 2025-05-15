@@ -1021,7 +1021,7 @@ PAGES = {
 def main():
     init_session_state()
     
-    st.sidebar.image("https://assets-global.website-files.com/635273ea37c256ef28f52930/635273ea37c256f4f5f52a71_Logo%20Purple.png", width=200)
+    st.sidebar.image("https://mma.prnewswire.com/media/1677414/Hakkoda_Logo.jpg?p=facebook", width=200)
     st.sidebar.title("Healthcare Delivery OS")
     st.sidebar.markdown("---")
     
