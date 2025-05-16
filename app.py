@@ -603,10 +603,10 @@ def render_projects_page():
                 st.dataframe(at_risk_df[final_at_risk_cols], use_container_width=True)
             else: st.success("🎉 No projects currently marked Red or Yellow!")
         else: st.info("No project data or 'Status (R/Y/G)' column available to determine at-risk projects.")
-        st.subheader("Non-Green Projects (from indicators module)")
-        non_green_list = kpis.get('non_green_projects_list', [])
-        if non_green_list: st.table(pd.DataFrame(non_green_list))
-        else: st.success("🎉 All projects are Green according to ratio calculation (or data unavailable)!")
+        # st.subheader("Non-Green Projects (from indicators module)")
+        # non_green_list = kpis.get('non_green_projects_list', [])
+        # if non_green_list: st.table(pd.DataFrame(non_green_list))
+        # else: st.success("🎉 All projects are Green according to ratio calculation (or data unavailable)!")
 
     with tab3:
         st.subheader("Project Score Analysis")
