@@ -496,18 +496,18 @@ def render_home_dashboard():
                            delta_label="of target",
                            card_class="good" if kpis.get('customer_nps_vs_target_pct',0) >=100 else "warning")
 
-    st.markdown("<div class='section-header'>✨ AI-Powered Top Action Items</div>", unsafe_allow_html=True)
-    if 'ai_top_actions' not in st.session_state or st.button("🔄 Regenerate AI Actions"):
-        with st.spinner("Generating AI Action Items..."):
-            st.session_state.ai_top_actions = indicators.get_top3_action_items(
-                st.session_state.all_data, 
+    st.markdown("<div class='section-header'>📄 Daily Executive Digest</div>", unsafe_allow_html=True)
+    if 'daily_digest_content' not in st.session_state or st.button("🔄 Regenerate Daily Digest"):
+        with st.spinner("Generating Daily Executive Digest..."):
+            st.session_state.daily_digest_content = indicators.get_daily_digest_content(
+                st.session_state.all_data,
                 st.session_state.openai_client,
                 st.session_state.get("data_context_string", "No data context available.")
             )
-    if 'ai_top_actions' in st.session_state:
-        ai_actions_content = st.session_state.ai_top_actions
-        if not isinstance(ai_actions_content, str): ai_actions_content = str(ai_actions_content) 
-        st.info(ai_actions_content)
+    if 'daily_digest_content' in st.session_state:
+        digest_content = st.session_state.daily_digest_content
+        if not isinstance(digest_content, str): digest_content = str(digest_content)
+        st.markdown(digest_content, unsafe_allow_html=True) # Using st.markdown for better rendering of the digest
 
     st.markdown("<div class='section-header'>📉 Lagging Indicators</div>", unsafe_allow_html=True)
     lag_cols = st.columns(3)
@@ -1006,6 +1006,154 @@ def render_manage_pipeline_form():
                         st.rerun()
     else: st.info("Select a pipeline opportunity (by Account) to update its details.")
 
+def render_scenario_playground_page():
+    st.title("🧪 Scenario Playground")
+    st.markdown("Interactively adjust scenario assumptions and see the impact in real time.")
+
+    # --- Load scenario inputs ---
+    inputs_df = st.session_state.all_data.get('Scenario Model Inputs', pd.DataFrame())
+    if inputs_df.empty or not {'Assumption', 'Value'}.issubset(inputs_df.columns):
+        st.warning("No scenario inputs found or missing required columns.")
+        return
+
+    # --- Build baseline_inputs from the original sheet values (never changes) ---
+    baseline_inputs = {}
+    for _, row in inputs_df.iterrows():
+        label = row['Assumption']
+        value = row['Value']
+        if isinstance(value, (int, float)):
+            baseline_inputs[label] = float(value)
+        elif isinstance(value, str) and value.strip().endswith('%'):
+            try:
+                baseline_inputs[label] = float(value.strip().replace('%',''))
+            except Exception:
+                baseline_inputs[label] = 0.0
+        elif isinstance(value, str) and value.strip().startswith('$'):
+            try:
+                baseline_inputs[label] = float(value.strip().replace('$','').replace(',',''))
+            except Exception:
+                baseline_inputs[label] = 0.0
+        else:
+            baseline_inputs[label] = value
+
+    # --- Render input widgets dynamically, using baseline as default ---
+    st.subheader("Adjust Scenario Assumptions")
+    proposed_inputs = {}
+    for label, default in baseline_inputs.items():
+        # Use slider for percentages, number_input for numbers, etc.
+        if isinstance(default, float) or isinstance(default, int):
+            # If the label or value suggests percent, use slider
+            if '%' in label or (0 <= default <= 100 and not isinstance(default, bool)):
+                proposed_inputs[label] = st.slider(label, 0.0, 100.0, float(default), step=1.0)
+            else:
+                proposed_inputs[label] = st.number_input(label, value=float(default))
+        else:
+            proposed_inputs[label] = st.text_input(label, value=str(default))
+
+    # --- Calculation logic for scenarios ---
+    def calculate_scenarios(inputs):
+        try:
+            vp_hourly = float(inputs.get('VP Hourly Selling Value', 0))
+            vp_hours_weekly = float(inputs.get('VP Hours Weekly on Delivery', 0))
+            head_hourly = float(inputs.get('Head of Delivery Hourly Strategic Delivery Value', 0))
+            head_hours_weekly = float(inputs.get('Head of Delivery Weekly Tactical Delivery Hours', 0))
+            avg_project_size = float(inputs.get('Avg. Project Size', 0))
+            sales_conv_rate = float(inputs.get('Sales Conversion Rate (%)', 0)) / 100.0
+            cost_turnover = float(inputs.get('Avg. Cost of Turnover per Senior Employee', 0))
+            pct_projects_at_risk = float(inputs.get('% Projects at Risk', 0)) / 100.0
+            revenue_at_risk = float(inputs.get('Revenue at Risk due to troubled projects', 0))
+            work_weeks = float(inputs.get('Work Weeks in a year', 50))
+            chief_salary = float(inputs.get('Cost of Chief of Staff Salary', 100000)) if 'Cost of Chief of Staff Salary' in inputs else 100000
+        except Exception as e:
+            st.error(f"Error parsing inputs: {e}")
+            return {}
+        results = {}
+        # Do Nothing scenario calculations
+        results['Lost Sales (VP involvement)'] = -1 * vp_hours_weekly * vp_hourly * work_weeks
+        results['Strategic Loss (Head of Delivery Role)'] = -1 * head_hours_weekly * head_hourly * work_weeks
+        results['Project Recovery Costs'] = -1 * revenue_at_risk * pct_projects_at_risk
+        results['Employee Turnover Impact'] = -1 * 3 * cost_turnover
+        results['Regained VP Selling Time'] = 12 * vp_hourly * work_weeks
+        results['Strategic Delivery Capacity Recovered'] = 15 * head_hourly * work_weeks
+        results['Project Health Improvement'] = 0.5 * revenue_at_risk * pct_projects_at_risk
+        results['Improved Retention'] = 2 * cost_turnover
+        results['Cost of Chief of Staff Salary'] = -1 * chief_salary
+        # Totals
+        results['Total Negative Impact'] = (
+            results['Lost Sales (VP involvement)'] +
+            results['Strategic Loss (Head of Delivery Role)'] +
+            results['Project Recovery Costs'] +
+            results['Employee Turnover Impact']
+        )
+        results['Total Positive Impact'] = (
+            results['Regained VP Selling Time'] +
+            results['Strategic Delivery Capacity Recovered'] +
+            results['Project Health Improvement'] +
+            results['Improved Retention'] +
+            results['Cost of Chief of Staff Salary']
+        )
+        return results
+
+    # --- Calculate both scenarios ---
+    baseline_results = calculate_scenarios(baseline_inputs)
+    proposed_results = calculate_scenarios(proposed_inputs)
+
+    # --- Display results ---
+    st.subheader("Scenario Results")
+    categories = [
+        'Lost Sales (VP involvement)',
+        'Strategic Loss (Head of Delivery Role)',
+        'Project Recovery Costs',
+        'Employee Turnover Impact',
+        'Regained VP Selling Time',
+        'Strategic Delivery Capacity Recovered',
+        'Project Health Improvement',
+        'Improved Retention',
+        'Cost of Chief of Staff Salary',
+        'Total Negative Impact',
+        'Total Positive Impact',
+    ]
+    data = []
+    for cat in categories:
+        base_val = baseline_results.get(cat, 0)
+        prop_val = proposed_results.get(cat, 0)
+        diff = prop_val - base_val
+        data.append({
+            "Category": cat,
+            "Do Nothing": base_val,
+            "Proposed": prop_val,
+            "Difference": diff
+        })
+    # Ensure totals are at the bottom
+    results_df = pd.DataFrame(data)
+    results_df['sort_order'] = results_df['Category'].apply(lambda x: 2 if 'Total' in x else (1 if 'Recovered' in x or 'Improved' in x or 'Regained' in x else 0))
+    results_df = results_df.sort_values(by=['sort_order', 'Category']).drop('sort_order', axis=1)
+    def fmt(val):
+        if isinstance(val, (int, float)):
+            return f"${val:,.0f}"
+        return val
+    st.dataframe(results_df.style.format({"Do Nothing": fmt, "Proposed": fmt, "Difference": fmt}), use_container_width=True)
+
+    st.subheader("🤖 Scenario AI Assistant")
+    scenario_question = st.text_input("Ask about this scenario (tradeoffs, opportunity cost, etc.)...")
+    if scenario_question and st.session_state.openai_client:
+        with st.spinner("Thinking..."):
+            context = f"Scenario Inputs:\n{proposed_inputs}\n\nScenario Results:\n{results_df.to_string(index=False)}"
+            try:
+                completion = st.session_state.openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a strategic scenario modeling assistant for healthcare delivery. Help the user analyze tradeoffs, opportunity cost, and scenario impacts."},
+                        {"role": "user", "content": f"{context}\n\nQuestion: {scenario_question}"}
+                    ]
+                )
+                response_text = completion.choices[0].message.content
+            except Exception as e:
+                response_text = f"Error querying OpenAI: {str(e)}"
+            st.markdown(response_text)
+    elif scenario_question:
+        st.warning("OpenAI client not initialized. Cannot process scenario questions.")
+
 # --- Main Application ---
 PAGES = {
     "🏠 Home": render_home_dashboard,
@@ -1016,6 +1164,7 @@ PAGES = {
     "📝 Manage Data": render_manage_data_page, 
     "⚙️ Scenario Modeling": render_scenario_modeling_page,
     "🔍 Data Explorer": render_data_explorer_page,
+    "🧪 Scenario Playground": render_scenario_playground_page,
 }
 
 def main():

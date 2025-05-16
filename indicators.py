@@ -518,3 +518,61 @@ Return your answer as a markdown numbered list. Example:
         return response.choices[0].message.content
     except Exception as e:
         return f"Error generating AI action items: {str(e)}"
+
+def get_daily_digest_content(data, openai_client, data_context_string):
+    if not openai_client:
+        return "OpenAI client not configured. Cannot generate the Daily Digest."
+
+    max_context_len = 100000  # Adjust as needed, keeping OpenAI token limits in mind
+    if len(data_context_string) > max_context_len:
+        data_context_string = data_context_string[:max_context_len] + "\n... (data truncated for brevity)"
+
+    prompt = f"""
+You are an AI executive assistant for a healthcare delivery organization. Your task is to generate a "Daily Executive Digest".
+This digest should be concise, data-driven, and highlight key information for leadership.
+The output must be in well-formatted markdown.
+
+Based on the following data snapshot:
+{data_context_string}
+
+Please structure the digest as follows:
+
+**Overall Summary:**
+Provide a brief (2-3 sentences) overview of the current business health.
+
+**✅ On Track:**
+Highlight 2-3 key areas or metrics that are performing well or meeting targets.
+Be specific (e.g., "Revenue is X% of target", "Green Project Ratio at Y%").
+
+**⚠️ Needs Attention:**
+Identify 2-3 critical areas or metrics that are underperforming, at risk, or require immediate focus.
+Be specific (e.g., "Pipeline Coverage is A.Bx, below target of 3.0x", "N Red Projects with $Y total revenue at risk").
+
+**🎯 Top 3 Action Items:**
+List the three most urgent and actionable items for leadership today. These should be distinct from the "Needs Attention" section but can be derived from it.
+Focus on risks, underperformance, critical project issues, or urgent pipeline needs.
+Frame each item as a clear action, mentioning specific projects, people, or metrics if relevant.
+Example:
+1.  **Address Red Project 'Alpha':** Key issue is 'XYZ', revenue at risk is $ABC. Action: Convene an immediate review with the Project Manager.
+2.  **Boost Pipeline Coverage:** Currently at A.Bc (target 3.0x). Action: Direct sales team to prioritize 'Tier 1' opportunities and accelerate 'Tier 2' deal closures.
+3.  **Mitigate High Severity Risks:** N high-severity risks identified with a total impact of $Y. Action: Review mitigation plans for the top 2 risks with the risk owners.
+
+**💡 Focus for Today:**
+A brief concluding thought or strategic focus point for the day (1-2 sentences).
+
+Ensure the language is professional, direct, and suitable for an executive audience.
+The entire digest should be easily readable and scannable.
+"""
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an AI executive assistant tasked with generating a concise and actionable daily digest for healthcare delivery leadership. Output in markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=800  # Increased token limit for a more comprehensive digest
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error generating Daily Digest: {str(e)}"
