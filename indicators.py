@@ -519,6 +519,65 @@ Return your answer as a markdown numbered list. Example:
     except Exception as e:
         return f"Error generating AI action items: {str(e)}"
 
+def get_upcoming_key_dates(data, days_ahead=7):
+    """
+    Scans project and pipeline data for key dates occurring within the specified number of days.
+    """
+    upcoming_events = []
+    today = datetime.now().date()
+    future_date_limit = today + timedelta(days=days_ahead)
+
+    # Check Project Inventory for Project End Dates
+    project_df = data.get('Project Inventory')
+    if project_df is not None and not project_df.empty:
+        if 'Project Name' in project_df.columns and 'Project End Date' in project_df.columns:
+            project_df_copy = project_df.copy()
+            project_df_copy['Project End Date'] = pd.to_datetime(project_df_copy['Project End Date'], errors='coerce').dt.date
+            upcoming_ends = project_df_copy[
+                (project_df_copy['Project End Date'] >= today) &
+                (project_df_copy['Project End Date'] <= future_date_limit)
+            ]
+            for _, row in upcoming_ends.iterrows():
+                upcoming_events.append(f"- Project '{row['Project Name']}' is scheduled to end on {row['Project End Date']:%Y-%m-%d}.")
+        else:
+            if 'Project Name' not in project_df.columns: print("Warning: 'Project Name' column missing in Project Inventory for upcoming dates.")
+            if 'Project End Date' not in project_df.columns: print("Warning: 'Project End Date' column missing in Project Inventory for upcoming dates.")
+
+
+    # Check Pipeline for Closed Won Dates and Next Touchpoint Dates
+    pipeline_df = data.get('Pipeline')
+    if pipeline_df is not None and not pipeline_df.empty:
+        pipeline_df_copy = pipeline_df.copy()
+        # Closed Won Date
+        if 'Account' in pipeline_df_copy.columns and 'Closed Won Date' in pipeline_df_copy.columns:
+            pipeline_df_copy['Closed Won Date'] = pd.to_datetime(pipeline_df_copy['Closed Won Date'], errors='coerce').dt.date
+            upcoming_closes = pipeline_df_copy[
+                (pipeline_df_copy['Closed Won Date'] >= today) &
+                (pipeline_df_copy['Closed Won Date'] <= future_date_limit)
+            ]
+            for _, row in upcoming_closes.iterrows():
+                upcoming_events.append(f"- Deal for '{row['Account']}' is scheduled to close (won) on {row['Closed Won Date']:%Y-%m-%d}.")
+        else:
+            if 'Account' not in pipeline_df_copy.columns: print("Warning: 'Account' column missing in Pipeline for upcoming dates.")
+            if 'Closed Won Date' not in pipeline_df_copy.columns: print("Warning: 'Closed Won Date' column missing in Pipeline for upcoming dates.")
+
+        # Next Touchpoint Date
+        if 'Account' in pipeline_df_copy.columns and 'Next Touchpoint Date' in pipeline_df_copy.columns:
+            pipeline_df_copy['Next Touchpoint Date'] = pd.to_datetime(pipeline_df_copy['Next Touchpoint Date'], errors='coerce').dt.date
+            upcoming_touchpoints = pipeline_df_copy[
+                (pipeline_df_copy['Next Touchpoint Date'] >= today) &
+                (pipeline_df_copy['Next Touchpoint Date'] <= future_date_limit)
+            ]
+            for _, row in upcoming_touchpoints.iterrows():
+                upcoming_events.append(f"- Next touchpoint for '{row['Account']}' is scheduled on {row['Next Touchpoint Date']:%Y-%m-%d}.")
+        else:
+            # 'Account' missing check already done above for Closed Won Date
+            if 'Next Touchpoint Date' not in pipeline_df_copy.columns: print("Warning: 'Next Touchpoint Date' column missing in Pipeline for upcoming dates.")
+
+    if not upcoming_events:
+        return "No key dates identified in the next 7 days."
+    return "\n".join(upcoming_events) # Using \n for markdown newlines in the prompt
+
 def get_daily_digest_content(data, openai_client, data_context_string):
     if not openai_client:
         return "OpenAI client not configured. Cannot generate the Daily Digest."
@@ -526,6 +585,8 @@ def get_daily_digest_content(data, openai_client, data_context_string):
     max_context_len = 100000  # Adjust as needed, keeping OpenAI token limits in mind
     if len(data_context_string) > max_context_len:
         data_context_string = data_context_string[:max_context_len] + "\n... (data truncated for brevity)"
+
+    upcoming_key_dates_str = get_upcoming_key_dates(data) # Get upcoming dates
 
     prompt = f"""
 You are an AI executive assistant for a healthcare delivery organization. Your task is to generate a "Daily Executive Digest".
@@ -547,6 +608,9 @@ Be specific (e.g., "Revenue is X% of target", "Green Project Ratio at Y%").
 **⚠️ Needs Attention:**
 Identify 2-3 critical areas or metrics that are underperforming, at risk, or require immediate focus.
 Be specific (e.g., "Pipeline Coverage is A.Bx, below target of 3.0x", "N Red Projects with $Y total revenue at risk").
+
+**🗓️ Key Dates This Week:**
+{upcoming_key_dates_str}
 
 **🎯 Top 3 Action Items:**
 List the three most urgent and actionable items for leadership today. These should be distinct from the "Needs Attention" section but can be derived from it.

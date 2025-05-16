@@ -60,6 +60,7 @@ Below is the schema definition for each tab in the google sheet.
 | Account                | Name of the customer or account in the sales pipeline.                      |
 | Opportunity Created Date    | Date when the opportunity was first logged (YYYY-MM-DD).                     |
 | Last Touchpoint Date        | A specific field to track the last touchpoint for this pursuit.             |
+| Next Touchpoint Date        | A specific field to track the next touchpoint for this pursuit.             |
 | Closed Won Date             | Date when the deal was successfully closed (YYYY-MM-DD).                    |
 | Support Focus Type          | Primary type of support required (Tier 1/2/3).              |
 | Perceived Annual AMO        | User’s estimated Annual Managed Offerings revenue potential.               |
