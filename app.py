@@ -626,7 +626,7 @@ def render_projects_page():
                 project_df_for_scores['Total Project Score Num'] = indicators.safe_to_numeric(project_df_for_scores['Total Project Score'])
                 fig_total = px.histogram(project_df_for_scores.dropna(subset=['Total Project Score Num']), x='Total Project Score Num', title='Total Project Score Distribution', nbins=10, text_auto=True)
                 fig_total.update_layout(bargap=0.1); st.plotly_chart(fig_total, use_container_width=True)
-            else: st.info("Total Project Score data not available for distribution chart.")
+            else: st.info("Total Project Score data not available for distribution.")
             st.write(f"Top Project (Total Score): **{kpis.get('top_project_by_total_score', 'N/A')}**")
             st.write(f"Bottom Project (Total Score): **{kpis.get('bottom_project_by_total_score', 'N/A')}**")
             st.write("Total Score Bands (%):"); st.json(kpis.get('total_project_score_bands_pct', {}))
@@ -890,7 +890,7 @@ def render_manage_project_form():
             new_key_issues = st.text_area("Key Issues", value=default_key_issues, height=100)
             new_next_steps = st.text_area("Next Steps", value=default_next_steps, height=100)
             new_checkin_date = st.date_input("Last Sponsor Check-in Date", value=default_checkin_date)
-            new_checkin_notes = st.text_area("Sponsor Check-in Notes", value=default_checkin_notes, height=150)
+            new_checkin_notes = st.text_area("Sponsor Checkin Notes", value=default_checkin_notes, height=150)
             
             submitted = st.form_submit_button("💾 Update Project in Google Sheet")
 
@@ -1154,6 +1154,223 @@ def render_scenario_playground_page():
     elif scenario_question:
         st.warning("OpenAI client not initialized. Cannot process scenario questions.")
 
+def render_whale_hunting_page():
+    st.title("🐳 Whale Hunting: Top Strategic Pursuits")
+    pipeline_df = st.session_state.all_data.get('Pipeline', pd.DataFrame())
+
+    if pipeline_df.empty:
+        st.warning("Pipeline data not loaded. Cannot display whale hunting information.")
+        return
+
+    # Ensure correct data types
+    pipeline_df['Percieved Annual AMO'] = indicators.safe_to_numeric(pipeline_df['Percieved Annual AMO'])
+    pipeline_df['Open Pipeline_Active Work'] = indicators.safe_to_numeric(pipeline_df.get('Open Pipeline_Active Work', pd.Series(dtype=float)))
+    pipeline_df['Pipeline Score'] = indicators.safe_to_numeric(pipeline_df.get('Pipeline Score', pd.Series(dtype=float)))
+    pipeline_df['Pursuit Tier'] = pipeline_df['Pursuit Tier'].astype(str)
+
+    # Filter for Tier 1 whales
+    tier_1_whales = pipeline_df[pipeline_df['Pursuit Tier'].str.upper() == 'TIER 1']
+    
+    if tier_1_whales.empty:
+        st.info("No Tier 1 opportunities found in the pipeline.")
+        return
+
+    # Sort by Percieved Annual AMO
+    whales_sorted = tier_1_whales.sort_values(by='Percieved Annual AMO', ascending=False)
+
+    num_whales_to_show = st.number_input("Number of Top Whales to Display:", min_value=1, max_value=len(whales_sorted), value=min(5, len(whales_sorted)), step=1)
+
+    if 'Account' not in whales_sorted.columns:
+        st.error("'Account' column is missing from the Pipeline data. Cannot display battle cards.")
+        return
+
+    top_n_whales = whales_sorted.head(num_whales_to_show)
+
+    for index, row in top_n_whales.iterrows():
+        account_name = row['Account']
+        amo = row['Percieved Annual AMO']
+        
+        expander_title = f"{account_name} - AMO: {format_currency(amo)}"
+        with st.expander(expander_title):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown(f"**Account:** {account_name}")
+                st.markdown(f"**Percieved Annual AMO:** {format_currency(amo)}")
+                st.markdown(f"**Current Opportunity Value:** {format_currency(row.get('Open Pipeline_Active Work', 0))}")
+                st.markdown(f"**Pursuit Tier:** {row.get('Pursuit Tier', 'N/A')}")
+                st.markdown(f"**Horizon:** {row.get('Horizon', 'N/A')}")
+                st.markdown(f"**Pipeline Score:** {format_number(row.get('Pipeline Score', 0), 1)}")
+                st.markdown(f"**Deal Registered (Y/N):** {row.get('Deal Registered YN', 'N/A')}") # Corrected from Deal Registered
+
+            with col2:
+                st.markdown(f"**Opportunity Created:** {row.get('Opportunity Created Date', 'N/A')}")
+                st.markdown(f"**Last Touchpoint:** {row.get('Last Touchpoint Date', 'N/A')}")
+                st.markdown(f"**Key Client Contacts:** {row.get('Key Client Contacts', 'N/A')}")
+                st.markdown(f"**Internal Pursuit Team:** {row.get('Internal Pursuit Team', 'N/A')}")
+                st.markdown(f"**Win Themes:** {row.get('Win Themes', 'N/A')}")
+                st.markdown(f"**Known Competitors:** {row.get('Known Competitors', 'N/A')}")
+
+            st.markdown("**Notes:**")
+            st.text_area("Notes:", value=str(row.get('Notes', '')), height=100, key=f"notes_{account_name}_{index}", disabled=True)
+            st.markdown("**Actions:**")
+            st.text_area("Actions:", value=str(row.get('Actions', '')), height=100, key=f"actions_{account_name}_{index}", disabled=True)
+            st.markdown("**Help Needed:**")
+            st.text_area("Help Needed:", value=str(row.get('Help Needed', '')), height=75, key=f"help_{account_name}_{index}", disabled=True)
+            
+            edit_button_key = f"edit_whale_{account_name.replace(' ','_')}_{index}"
+            if st.button(f"✏️ Edit {account_name}", key=edit_button_key):
+                st.session_state.selected_pipeline_to_edit = account_name
+                st.session_state.manage_data_entity_type = "Pipeline Opportunity"
+                st.session_state.current_page = "📝 Manage Data"
+                st.rerun()
+
+def render_staffing_health_page():
+    st.title("🧑‍💻 Project Staffing Health")
+    
+    project_df = st.session_state.all_data.get('Project Inventory', pd.DataFrame())
+    util_df = st.session_state.all_data.get('Team Utilization', pd.DataFrame())
+
+    if project_df.empty:
+        st.warning("Project Inventory data not loaded. Cannot display staffing health.")
+        return
+    
+    if util_df.empty:
+        st.info("Team Utilization data not available. Staffing details may be incomplete.")
+        # We can still show projects, but with missing team data
+
+    # --- 1. Filter for Active Projects ---
+    project_df_c = project_df.copy()
+    if 'Project End Date' not in project_df_c.columns:
+        st.error("'Project End Date' column missing from Project Inventory. Cannot determine active projects.")
+        return
+    project_df_c['Project End Date'] = pd.to_datetime(project_df_c['Project End Date'], errors='coerce')
+    current_date = pd.to_datetime(date.today())
+    active_projects_df = project_df_c[
+        (project_df_c['Project End Date'].isna()) | (project_df_c['Project End Date'] >= current_date)
+    ]
+
+    if active_projects_df.empty:
+        st.info("No active projects found.")
+        return
+
+    # --- 2. Prepare Utilization Data ---
+    util_df_c = util_df.copy()
+    if not util_df_c.empty:
+        if 'Utilization (%)' in util_df_c.columns:
+            util_df_c['Utilization (%)'] = indicators.safe_to_numeric(util_df_c['Utilization (%)'])
+        else:
+            util_df_c['Utilization (%)'] = 0 # Default if missing
+            st.warning("'Utilization (%)' column missing in Team Utilization.")
+
+        if 'Latest Pulse Score' in util_df_c.columns:
+            util_df_c['Latest Pulse Score'] = indicators.safe_to_numeric(util_df_c['Latest Pulse Score'])
+        else:
+            util_df_c['Latest Pulse Score'] = 0 # Default if missing
+            st.warning("'Latest Pulse Score' column missing in Team Utilization.")
+        
+        if 'Project Assignments' not in util_df_c.columns:
+            st.warning("'Project Assignments' column missing in Team Utilization. Cannot link staff to projects.")
+            util_df_c = pd.DataFrame() # Effectively disable staff lookups
+        else:
+             util_df_c['Project Assignments'] = util_df_c['Project Assignments'].astype(str).fillna('')
+
+    staffing_health_data = []
+    required_project_cols = ['Project Name', 'Client', 'Status (R/Y/G)', 'Team Resourcing', 'Project End Date']
+    if not all(col in active_projects_df.columns for col in required_project_cols):
+        st.error(f"One or more required columns ({required_project_cols}) are missing from Project Inventory.")
+        return
+
+    # --- 3. Combine Data for Each Active Project ---
+    for index, project_row in active_projects_df.iterrows():
+        project_name = project_row['Project Name']
+        assigned_team_members = []
+        team_utilizations = []
+        team_pulse_scores = []
+
+        if not util_df_c.empty and 'Employee Name' in util_df_c.columns:
+            for _, staff_row in util_df_c.iterrows():
+                # Split by comma, strip whitespace from each project name
+                assigned_projects = [p.strip() for p in staff_row.get('Project Assignments', '').split(',')]
+                if project_name in assigned_projects:
+                    assigned_team_members.append(staff_row['Employee Name'])
+                    if 'Utilization (%)' in staff_row and pd.notna(staff_row['Utilization (%)']):
+                        team_utilizations.append(staff_row['Utilization (%)'])
+                    if 'Latest Pulse Score' in staff_row and pd.notna(staff_row['Latest Pulse Score']):
+                        team_pulse_scores.append(staff_row['Latest Pulse Score'])
+        
+        avg_utilization = sum(team_utilizations) / len(team_utilizations) if team_utilizations else 0
+        avg_pulse = sum(team_pulse_scores) / len(team_pulse_scores) if team_pulse_scores else 0
+
+        staffing_health_data.append({
+            'Project Name': project_name,
+            'Client': project_row['Client'],
+            'Status (R/Y/G)': project_row['Status (R/Y/G)'],
+            'Team Resourcing': project_row['Team Resourcing'],
+            'Assigned Team Size': len(assigned_team_members),
+            'Assigned Team Members': ", ".join(assigned_team_members) if assigned_team_members else 'N/A',
+            'Avg. Team Utilization %': avg_utilization,
+            'Avg. Team Pulse Score': avg_pulse,
+            'Project End Date': project_row['Project End Date'].strftime('%Y-%m-%d') if pd.notna(project_row['Project End Date']) else 'N/A'
+        })
+
+    if not staffing_health_data:
+        st.info("No staffing health data to display for active projects.")
+        return
+
+    display_df = pd.DataFrame(staffing_health_data)
+    
+    # --- 4. Display Data with Styling and Filters ---
+    st.subheader("Active Projects Staffing Overview")
+
+    # Filters
+    client_list = ["All"] + sorted(display_df['Client'].unique().tolist())
+    selected_client = st.selectbox("Filter by Client:", client_list)
+
+    # Handle potential NA values in Team Resourcing for sorting
+    unique_resourcing_statuses = display_df['Team Resourcing'].unique()
+    # Convert NA to a string like 'N/A' or filter them out, then convert all to string before sorting
+    resourcing_status_list = ["All"] + sorted([str(status) if pd.notna(status) else "N/A" for status in unique_resourcing_statuses])
+    # Remove duplicates that might arise if 'N/A' was already a string value
+    resourcing_status_list = sorted(list(set(resourcing_status_list)))
+    # Ensure "All" is first if it got re-sorted by set operation
+    if "All" in resourcing_status_list: 
+        resourcing_status_list.remove("All")
+        resourcing_status_list.insert(0, "All")
+        
+    selected_resourcing = st.selectbox("Filter by Team Resourcing Status:", resourcing_status_list)
+
+    filtered_df = display_df.copy()
+    if selected_client != "All":
+        filtered_df = filtered_df[filtered_df['Client'] == selected_client]
+    if selected_resourcing != "All":
+        filtered_df = filtered_df[filtered_df['Team Resourcing'] == selected_resourcing]
+
+    # Styling function for Team Resourcing
+    def style_team_resourcing(val):
+        val_lower = str(val).lower()
+        color = 'white' # Default
+        if val_lower == 'yes':
+            color = 'lightgreen'
+        elif val_lower == 'some gaps':
+            color = 'lightyellow'
+        elif val_lower in ['understaffed', 'misaligned', 'no core team']:
+            color = '#ffcccb' # Light red
+        return f'background-color: {color}'
+
+    # Format numbers in the DataFrame before styling
+    if not filtered_df.empty:
+        formatted_df = filtered_df.copy()
+        formatted_df['Avg. Team Utilization %'] = formatted_df['Avg. Team Utilization %'].apply(lambda x: format_percentage(x, 1, default_na='N/A'))
+        formatted_df['Avg. Team Pulse Score'] = formatted_df['Avg. Team Pulse Score'].apply(lambda x: format_number(x, 1, default_na='N/A'))
+
+        st.dataframe(
+            formatted_df.style.applymap(style_team_resourcing, subset=['Team Resourcing']),
+            use_container_width=True
+        )
+    else:
+        st.info("No projects match the selected filter criteria.")
+
 # --- Main Application ---
 PAGES = {
     "🏠 Home": render_home_dashboard,
@@ -1165,6 +1382,8 @@ PAGES = {
     "⚙️ Scenario Modeling": render_scenario_modeling_page,
     "🔍 Data Explorer": render_data_explorer_page,
     "🧪 Scenario Playground": render_scenario_playground_page,
+    "🐳 Whale Hunting": render_whale_hunting_page,
+    "🧑‍💻 Project Staffing Health": render_staffing_health_page,
 }
 
 def main():
